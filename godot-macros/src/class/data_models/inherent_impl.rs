@@ -543,7 +543,8 @@ fn make_abstract_items(
         );
     });
 
-    let trait_name = format_ident!("{class_name}Abstract");
+    // Named like the engine interface traits (`INode`, `IResource`), which serve the same purpose for engine base classes.
+    let trait_name = format_ident!("I{class_name}");
     let visibility_macro = util::format_class_visibility_macro(class_name);
 
     let trait_methods = abstract_funcs.iter().map(|def| {
@@ -563,9 +564,9 @@ fn make_abstract_items(
     });
 
     let trait_doc = format!(
-        "Abstract methods of [`{class_name}`], which every subclass must implement.
-
-        Declared by the `#[func(abstract)]` functions of `{class_name}`. Implement it with         `#[godot_api] impl {trait_name} for MySubclass`, so that the methods are registered with Godot for the subclass."
+        "Abstract methods of [`{class_name}`], which every subclass must implement.\n\n\
+        Declared by the `#[func(abstract)]` functions of `{class_name}`. Implement it with \
+        `#[godot_api] impl {trait_name} for MySubclass`, so that the methods are registered with Godot for the subclass."
     );
 
     code.extend(quote! {

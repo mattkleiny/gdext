@@ -184,9 +184,9 @@ use crate::util::{KvParser, bail, ident};
 /// #[godot_api]
 /// impl Circle {}
 ///
-/// // Implementing the generated `ShapeAbstract` trait registers `area()` for `Circle`.
+/// // Implementing the generated `IShape` trait registers `area()` for `Circle`.
 /// #[godot_api]
-/// impl ShapeAbstract for Circle {
+/// impl IShape for Circle {
 ///     fn area(&self) -> f64 {
 ///         std::f64::consts::PI * self.radius * self.radius
 ///     }
@@ -1149,8 +1149,9 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// method. The abstract class registers only the signature with Godot, flagged as a required virtual method (`METHOD_FLAG_VIRTUAL` and,
 /// since Godot 4.5, `METHOD_FLAG_VIRTUAL_REQUIRED`), so the editor and scripts know that overriding it is mandatory.
 ///
-/// For each class with at least one abstract method, the macro generates a trait `<Class>Abstract` containing those methods. Subclasses
-/// implement it through `#[godot_api] impl <Class>Abstract for Subclass`, which both satisfies the Rust-level requirement and registers
+/// For each class with at least one abstract method, the macro generates a trait `I<Class>` containing those methods -- named like the
+/// engine interface traits (`INode`, `IResource`), which play the same role for engine base classes. Subclasses
+/// implement it through `#[godot_api] impl I<Class> for Subclass`, which both satisfies the Rust-level requirement and registers
 /// the methods with Godot for that subclass. Forgetting the implementation is a compile error, not a runtime surprise.
 ///
 /// ```no_run
@@ -1181,7 +1182,7 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// impl Square {}
 ///
 /// #[godot_api]
-/// impl ShapeAbstract for Square {
+/// impl IShape for Square {
 ///     fn area(&self) -> f64 {
 ///         self.side * self.side
 ///     }
@@ -1222,7 +1223,7 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// ```
 ///
 /// `#[func(abstract)]` requires a `self` receiver and cannot be combined with `virtual`, `gd_self`, `rename`, `#[rpc]` or
-/// `#[opt(default = ...)]`. The subclass must declare its `#[godot_api] impl <Class>Abstract` block *and* a primary `#[godot_api] impl`
+/// `#[opt(default = ...)]`. The subclass must declare its `#[godot_api] impl I<Class>` block *and* a primary `#[godot_api] impl`
 /// block, which holds the registration storage both share.
 ///
 /// Note the difference to [`#[func(virtual)]`](#virtual-methods): that one has a Rust default implementation which a *GDScript* subclass may

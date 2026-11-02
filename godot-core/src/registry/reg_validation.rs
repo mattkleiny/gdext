@@ -129,7 +129,7 @@ mod strict {
     /// Verifies that every concrete subclass of an `#[class(abstract)]` class implements all of its `#[func(abstract)]` methods.
     ///
     /// Abstract methods are registered as *virtual* methods on the declaring class, which only supplies metadata -- there is no callable
-    /// method bind. A concrete subclass must register its own method of the same name, which `#[godot_api] impl <Class>Abstract for Sub`
+    /// method bind. A concrete subclass must register its own method of the same name, which `#[godot_api] impl I<Class> for Sub`
     /// does. Rust alone cannot enforce this (the subclass's macros don't see the base class's `impl` block), hence the check here.
     ///
     /// Runs after all classes of the current init level are registered, so that `ClassDB` knows the full hierarchy.
@@ -158,7 +158,7 @@ mod strict {
 
                 defer_startup_fatal!(
                     "Class `{subclass_name}` does not implement the abstract method `{class_id}::{method_name}`.\n\
-                     Add it via `#[godot_api] impl {class_id}Abstract for {subclass_name}`."
+                     Add it via `#[godot_api] impl I{class_id} for {subclass_name}`."
                 );
             }
         }

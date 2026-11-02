@@ -62,7 +62,7 @@ impl Circle {
 }
 
 #[godot_api]
-impl AbstractShapeAbstract for Circle {
+impl IAbstractShape for Circle {
     fn area(&self) -> f64 {
         std::f64::consts::PI * self.radius * self.radius
     }
@@ -85,7 +85,7 @@ pub struct Square {
 impl Square {}
 
 #[godot_api]
-impl AbstractShapeAbstract for Square {
+impl IAbstractShape for Square {
     fn area(&self) -> f64 {
         self.side * self.side
     }
@@ -131,14 +131,14 @@ pub struct Goblin {
 impl Goblin {}
 
 #[godot_api]
-impl AbstractActorAbstract for Goblin {
+impl IAbstractActor for Goblin {
     fn actor_name(&self) -> GString {
         "goblin".into()
     }
 }
 
 #[godot_api]
-impl AbstractEnemyAbstract for Goblin {
+impl IAbstractEnemy for Goblin {
     fn damage(&self) -> i64 {
         3
     }
