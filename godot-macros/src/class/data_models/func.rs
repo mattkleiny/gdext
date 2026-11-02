@@ -13,6 +13,7 @@ use crate::util::{bail, bail_fn, ident, safe_ident, to_spanned_tuple};
 use crate::{ParseResult, util};
 
 /// Information used for registering a Rust function with Godot.
+#[derive(Clone)]
 pub struct FuncDefinition {
     /// Refined signature, with higher level info and renamed parameters.
     pub signature_info: SignatureInfo,
@@ -76,6 +77,7 @@ pub fn make_virtual_callback(
         signature_info,
         before_kind,
         interface_trait,
+        None,
     );
     let sig_params = signature_info.params_type();
     let sig_ret = &signature_info.return_type;
@@ -108,6 +110,47 @@ pub fn make_virtual_callback(
     }
 }
 
+/// Paths to the projection functions reaching the declaring class instance inside a subclass instance.
+///
+/// For an inherited registration, the instance storage holds the *subclass*; the declaring (base) class instance lives in a field of it.
+/// Both are paths to `fn` items (not closures), so the generated callback captures nothing and still coerces to a function pointer.
+#[derive(Clone)]
+pub struct Projection {
+    /// Path to a `fn(&T) -> &DeclaringClass`.
+    pub get: TokenStream,
+
+    /// Path to a `fn(&mut T) -> &mut DeclaringClass`.
+    pub get_mut: TokenStream,
+}
+
+impl Projection {
+    /// Projection through the generic parameters `T` (subclass) and `P` (projection marker) of a `__register_*` function.
+    pub fn generic_params() -> Self {
+        Self {
+            get: quote! { <P as ::godot::obj::RustBaseProjection<T, Self>>::get },
+            get_mut: quote! { <P as ::godot::obj::RustBaseProjection<T, Self>>::get_mut },
+        }
+    }
+}
+
+/// Generates code that registers a method inherited from a Rust base class, for the concrete subclass `T`.
+///
+/// The declaring class has no instances of its own, so the callback reads `T`'s storage and projects to the embedded base instance. `T` is
+/// a generic parameter here: this code is emitted inside a generic function, instantiated once per subclass.
+pub fn make_inherited_method_registration(
+    base_class_name: &Ident,
+    func_definition: FuncDefinition,
+    projection: &Projection,
+) -> ParseResult<TokenStream> {
+    make_method_registration_impl(
+        &ident("T"),
+        &base_class_name.to_string(),
+        func_definition,
+        None,
+        Some(projection),
+    )
+}
+
 /// Generates code that registers the specified method for the given class.
 pub fn make_method_registration(
     class_name: &Ident,
@@ -116,7 +159,24 @@ pub fn make_method_registration(
 ) -> ParseResult<TokenStream> {
     // Fresh ident, discarding span -- prevents IDE syntax highlighter from mapping generated unsafe code to user's class declaration.
     let class_name = ident(&class_name.to_string());
+    let display_name = class_name.to_string();
 
+    make_method_registration_impl(
+        &class_name,
+        &display_name,
+        func_definition,
+        interface_trait,
+        None,
+    )
+}
+
+fn make_method_registration_impl(
+    class_name: &Ident,
+    display_class_name: &str,
+    func_definition: FuncDefinition,
+    interface_trait: Option<&venial::TypeExpr>,
+    projection: Option<&Projection>,
+) -> ParseResult<TokenStream> {
     let signature_info = &func_definition.signature_info;
     let sig_params = signature_info.params_type();
     let sig_ret = &signature_info.return_type;
@@ -133,20 +193,21 @@ pub fn make_method_registration(
 
     if func_definition.is_abstract {
         return Ok(make_abstract_method_registration(
-            &class_name,
+            class_name,
             &func_definition,
             method_flags,
         ));
     }
 
     let forwarding_closure = make_forwarding_closure(
-        &class_name,
+        class_name,
         // Regular methods aren't engine virtuals, so there is no `virtuals::<Base>` signature to annotate with -- this also covers
-        // `#[godot_api] impl <Class>Abstract for Sub`, whose trait is user-declared.
+        // `#[godot_api] impl I<Class> for Sub`, whose trait is user-declared.
         None,
         signature_info,
         BeforeKind::Without,
         interface_trait,
+        projection,
     );
 
     let default_parameters = make_default_argument_vec(
@@ -155,7 +216,7 @@ pub fn make_method_registration(
     )?;
 
     // String literals
-    let class_name_str = class_name.to_string();
+    let class_name_str = display_class_name.to_string();
     let method_name_str = func_definition.godot_name();
 
     // String literals II
@@ -296,7 +357,7 @@ pub enum ReceiverType {
     Static,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SignatureInfo {
     pub method_name: Ident,
     pub receiver_type: ReceiverType,
@@ -360,6 +421,8 @@ fn make_forwarding_closure(
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
+    // `Some` when registering a method inherited from a Rust base class: the receiver is projected out of the subclass instance.
+    projection: Option<&Projection>,
 ) -> TokenStream {
     let method_name = &signature_info.method_name;
     let params = &signature_info.param_idents;
@@ -376,6 +439,24 @@ fn make_forwarding_closure(
         _ => quote! {},
     };
 
+    // With a projection, the guard yields the *subclass*; the declaring class instance is a field inside it. Borrowing still goes through
+    // the subclass's `GdCell` above, so re-entrancy tracking is unaffected.
+    //
+    // `receiver_*` is the expression a method is called *on*, `instance_*` the one passed as an explicit `self` argument.
+    let (receiver_ref, receiver_mut, instance_ref_arg, instance_mut_arg) = match projection {
+        Some(Projection { get, get_mut }) => {
+            let get = quote! { (#get)(&*__gdext_self) };
+            let get_mut = quote! { (#get_mut)(&mut *__gdext_self) };
+            (get.clone(), get_mut.clone(), get, get_mut)
+        }
+        None => (
+            quote! { __gdext_self },
+            quote! { __gdext_self },
+            quote! { &__gdext_self },
+            quote! { &mut __gdext_self },
+        ),
+    };
+
     let before_method_call = match before_kind {
         BeforeKind::WithBefore | BeforeKind::OnlyBefore => {
             let before_method = format_ident!("__before_{method_name}", span = method_name.span());
@@ -383,7 +464,7 @@ fn make_forwarding_closure(
                 // In case of GdSelf receiver use instance only to call the before_method.
                 quote! { ::godot::private::Storage::get_mut(&*storage).#before_method(); }
             } else {
-                quote! { __gdext_self.#before_method(); }
+                quote! { #receiver_mut.#before_method(); }
             }
         }
         BeforeKind::Without => TokenStream::new(),
@@ -404,8 +485,8 @@ fn make_forwarding_closure(
                 // Virtual methods.
 
                 let instance_ref = match signature_info.receiver_type {
-                    ReceiverType::Ref => quote! { &__gdext_self },
-                    ReceiverType::Mut => quote! { &mut __gdext_self },
+                    ReceiverType::Ref => instance_ref_arg.clone(),
+                    ReceiverType::Mut => instance_mut_arg.clone(),
                     _ => unreachable!("unexpected receiver type"), // checked above.
                 };
 
@@ -423,8 +504,12 @@ fn make_forwarding_closure(
                 // Methods are non-virtual.
 
                 sig_tuple_annotation = TokenStream::new();
+                let receiver = match signature_info.receiver_type {
+                    ReceiverType::Ref => &receiver_ref,
+                    _ => &receiver_mut,
+                };
                 method_call = quote! {
-                    __gdext_self.#method_name( #(#params),* )
+                    #receiver.#method_name( #(#params),* )
                 };
             };
 
@@ -708,7 +793,8 @@ fn make_abstract_method_registration(
 
             #type_and_bounds_check
 
-            let method_info = ClassMethodInfo::from_abstract_signature::<#class_name, CallParams, CallRet>(
+            let method_info = ClassMethodInfo::from_abstract_signature::<CallParams, CallRet>(
+                __godot_class_id,
                 StringName::from(#method_name_str),
                 #method_flags,
                 &[

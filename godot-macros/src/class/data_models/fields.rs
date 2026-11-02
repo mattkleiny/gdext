@@ -18,6 +18,12 @@ pub struct Fields {
     /// The field with type `Base<T>`, if available.
     pub base_field: Option<Field>,
 
+    /// For `#[class(base = SomeRustClass)]`: the field holding the embedded base class instance.
+    ///
+    /// Godot stores one extension instance per object, so a subclass object holds only *its own* struct; the base class's fields live in
+    /// this field. It is excluded from `all_fields`, since it is initialized and registered differently.
+    pub rust_base_field: Option<Field>,
+
     /// Deprecation warnings.
     pub deprecations: Vec<TokenStream>,
 

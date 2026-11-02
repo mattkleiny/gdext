@@ -128,61 +128,84 @@ use crate::util::{KvParser, bail, ident};
 /// `ClassDb::can_instantiate()` returns false and neither GDScript nor the editor offers a constructor for it.
 ///
 /// Abstract classes exist to be inherited: they are the only Rust classes that can appear in `#[class(base = ...)]` of another Rust class.
-/// They hold no instance state of their own, which restricts what they may declare:
+/// They may hold instance state and declare both concrete and abstract methods:
 ///
-/// * no `#[var]` or `#[export]` fields,
-/// * no `#[func]` with a `self` receiver -- use [`#[func(abstract)]`](attr.godot_api.html#abstract-methods) instead,
-/// * `#[class(init)]` and a user-defined `init()` are rejected; `#[func]` associated (static) functions, `#[constant]` and `#[signal]`
-///   are fine.
+/// * `#[var]` / `#[export]` fields -- the state lives in each subclass instance, and the properties are registered for the subclass,
+/// * `#[func]` with a `self` receiver -- inherited by every subclass, which can call it and operate on the base state,
+/// * [`#[func(abstract)]`](attr.godot_api.html#abstract-methods) -- declared without a body, implemented by every subclass,
+/// * `#[func]` associated (static) functions, `#[constant]` and `#[signal]`, which stay registered on the abstract class itself.
 ///
-/// The reason is that every Godot object whose class derives from an abstract class is an instance of some *concrete* subclass and holds
-/// that subclass's Rust struct -- there is no separate instance for the abstract class. Methods or property accessors registered for the
-/// abstract class would therefore be invoked with a `self` of the wrong type. For the same reason, `Gd::bind()` and `Gd::bind_mut()` panic
-/// on an abstract class; cast to the concrete subclass first (e.g. with [`Gd::try_cast()`][crate::obj::Gd::try_cast]).
+/// `Gd::bind()` and `Gd::bind_mut()` panic on an abstract class: every Godot object whose class derives from an abstract class is an
+/// instance of some *concrete* subclass and holds that subclass's Rust struct, so there is no `&AbstractClass` to hand out. Cast to the
+/// concrete subclass first (e.g. with [`Gd::try_cast()`][crate::obj::Gd::try_cast]).
 ///
 /// ```no_run
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// #[class(abstract, base = Resource)]
-/// struct Shape {}
+/// struct Shape {
+///     base: Base<Resource>,
+///
+///     #[var]
+///     #[init(val = 1.0)]
+///     scale: f64,
+/// }
 ///
 /// #[godot_api]
 /// impl Shape {
 ///     /// Every subclass must implement this.
 ///     #[func(abstract)]
 ///     fn area(&self) -> f64;
+///
+///     /// Inherited by every subclass, with access to the base state.
+///     #[func]
+///     fn grow(&mut self, by: f64) -> f64 {
+///         self.scale += by;
+///         self.scale
+///     }
 /// }
 /// ```
 ///
 /// ## Inheriting a Rust class -- `#[class(base = MyAbstractClass)]`
 /// `#[class(base = ...)]` also accepts another Rust class, as long as it is declared `#[class(abstract)]`. This is inheritance at the
 /// *Godot* level: the subclass is registered with the abstract class as its parent, so GDScript sees `Subclass extends Shape`, `Gd<Shape>`
-/// can hold subclass objects, and casts in both directions work. It is *not* Rust inheritance -- the subclass struct does not contain the
-/// base struct, and `Deref` to the base class is not provided.
+/// can hold subclass objects, and casts in both directions work.
 ///
-/// `GodotClass::Base` keeps pointing at the nearest *engine* class (`Resource` in the example below), so `Base<T>` fields and
-/// `impl I<EngineClass> for Subclass` keep working as usual.
+/// The subclass must hold the base class instance in a field of that type. Godot stores one extension instance per object, so a subclass
+/// object holds only *its own* struct -- the base class's fields have to live inside it. The engine-side `Base<T>` handle comes from the
+/// base class and must not be declared again; `self.base()` and `self.base_mut()` work as usual through it.
+///
+/// `GodotClass::Base` keeps pointing at the nearest *engine* class (`Resource` below), so `impl I<EngineClass> for Subclass` works as usual.
 ///
 /// ```no_run
 /// # use godot::prelude::*;
 /// # #[derive(GodotClass)]
 /// # #[class(abstract, base = Resource)]
-/// # struct Shape {}
+/// # struct Shape { base: Base<Resource>, #[var] #[init(val = 1.0)] scale: f64 }
 /// # #[godot_api]
 /// # impl Shape {
 /// #     #[func(abstract)]
 /// #     fn area(&self) -> f64;
+/// #     #[func]
+/// #     fn grow(&mut self, by: f64) -> f64 { self.scale += by; self.scale }
 /// # }
 /// #[derive(GodotClass)]
 /// #[class(init, base = Shape)]
 /// struct Circle {
+///     shape: Shape, // the base class instance; `Base<Resource>` comes from it.
+///
 ///     #[var]
 ///     radius: f64,
-///     base: Base<Resource>, // engine base, not `Shape`.
 /// }
 ///
 /// #[godot_api]
-/// impl Circle {}
+/// impl Circle {
+///     #[func]
+///     fn scaled_area(&self) -> f64 {
+///         // Base-class state and methods are reachable through the field.
+///         self.area() * self.shape.scale
+///     }
+/// }
 ///
 /// // Implementing the generated `IShape` trait registers `area()` for `Circle`.
 /// #[godot_api]
@@ -193,7 +216,11 @@ use crate::util::{KvParser, bail, ident};
 /// }
 /// ```
 ///
-/// Rejected at compile time -- an abstract class with a constructor:
+/// The base class's `#[func]`s and properties are registered for each concrete subclass, with a projection into the embedded instance. The
+/// projection is resolved at compile time, so calls cost no more than the subclass's own methods, and borrows still go through the
+/// subclass's cell -- re-entrancy behaves exactly as for a single class.
+///
+/// Rejected at compile time -- an abstract class with a Godot constructor:
 /// ```compile_fail
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
@@ -201,14 +228,35 @@ use crate::util::{KvParser, bail, ident};
 /// struct Shape {}
 /// ```
 ///
-/// ...an abstract class with a property:
+/// ...a subclass without the base class field:
 /// ```compile_fail
 /// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(abstract, base = Resource)]
+/// # struct Shape { base: Base<Resource> }
+/// # #[godot_api]
+/// # impl Shape {}
 /// #[derive(GodotClass)]
-/// #[class(abstract, base = Resource)]
-/// struct Shape {
+/// #[class(init, base = Shape)]
+/// struct Circle {
 ///     #[var]
-///     area: f64,
+///     radius: f64,
+/// }
+/// ```
+///
+/// ...a subclass declaring its own `Base<T>`:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(abstract, base = Resource)]
+/// # struct Shape { base: Base<Resource> }
+/// # #[godot_api]
+/// # impl Shape {}
+/// #[derive(GodotClass)]
+/// #[class(init, base = Shape)]
+/// struct Circle {
+///     shape: Shape,
+///     base: Base<Resource>,
 /// }
 /// ```
 ///
@@ -226,9 +274,14 @@ use crate::util::{KvParser, bail, ident};
 ///
 /// Limitations to be aware of:
 ///
-/// * The base class must be declared `#[class(abstract)]`; concrete Rust classes cannot be inherited.
+/// * The base class must be declared `#[class(abstract)]` and have a `#[godot_api] impl` block (possibly empty); concrete Rust classes
+///   cannot be inherited.
 /// * Engine virtual methods (`impl INode for Shape`) declared on the abstract class are *not* inherited by subclasses -- Godot asks the
 ///   most-derived extension class for its virtual table. Override them in each subclass.
+/// * A subclass must not re-declare a `#[func]` or `#[var]` name it inherits; Godot rejects the duplicate registration.
+/// * Inherited members are not visible on the base class in `ClassDB`, so GDScript code statically typed as the base class cannot see
+///   them. `#[func(abstract)]` declarations *are* visible there.
+/// * `#[func(gd_self)]` and methods in secondary `#[godot_api]` blocks are not inherited.
 /// * If the base class lives in another module whose name is not in scope, write it as a path (`base = crate::shapes::Shape`). Base classes
 ///   in another crate additionally need that crate's `inherit_from_<Class>__ensure_class_exists!` macro imported.
 ///
@@ -1158,7 +1211,9 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
 /// #[class(abstract, base = Resource)]
-/// struct Shape {}
+/// struct Shape {
+///     base: Base<Resource>,
+/// }
 ///
 /// #[godot_api]
 /// impl Shape {
@@ -1173,9 +1228,10 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// #[derive(GodotClass)]
 /// #[class(init, base = Shape)]
 /// struct Square {
+///     shape: Shape,
+///
 ///     #[var]
 ///     side: f64,
-///     base: Base<Resource>,
 /// }
 ///
 /// #[godot_api]
@@ -1198,7 +1254,7 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// # use godot::prelude::*;
 /// # #[derive(GodotClass)]
 /// # #[class(abstract, base = Resource)]
-/// # struct Shape {}
+/// # struct Shape { base: Base<Resource> }
 /// #[godot_api]
 /// impl Shape {
 ///     #[func(abstract)]

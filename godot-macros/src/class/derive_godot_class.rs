@@ -39,7 +39,13 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     let mut modifiers = Vec::new();
     let named_fields = named_fields(class, "#[derive(GodotClass)]")?;
     let mut struct_cfg = parse_struct_attributes(class)?;
-    let mut fields = parse_fields(named_fields, struct_cfg.init_strategy)?;
+
+    // Abstract classes get a Rust-level constructor too (subclasses build the embedded base instance with it), even though Godot never
+    // instantiates them -- so `#[init(val = ...)]` on their fields is meaningful.
+    let generates_godot_default =
+        matches!(struct_cfg.init_strategy, InitStrategy::Generated) || struct_cfg.is_abstract;
+    let user_base_ty = struct_cfg.user_base.as_ref().map(|_| &struct_cfg.base_ty);
+    let mut fields = parse_fields(named_fields, generates_godot_default, user_base_ty)?;
 
     if fields.has_tool_button {
         if !struct_cfg.is_tool {
@@ -56,17 +62,22 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         }
     }
 
-    if struct_cfg.is_abstract {
-        // Properties are registered with getter/setter methods on the declaring class; for an abstract class those would be invoked with a
-        // *subclass* instance, whose Rust struct is a different type. See the `#[class(abstract)]` docs.
-        if let Some(field) = fields
-            .all_fields
-            .iter()
-            .find(|field| field.var.is_some() || field.export.is_some())
-        {
+    if let Some(user_base) = &struct_cfg.user_base {
+        let base_path = &user_base.path;
+
+        // Godot stores one extension instance per object, so the base class's fields have to live inside this struct.
+        if fields.rust_base_field.is_none() {
+            return bail!(
+                &class.name,
+                "#[class(base = {base_path})] requires a field of type `{base_path}`, holding the base class instance",
+            );
+        }
+
+        // The engine-side `Base<T>` handle lives in the base class and is reached through it; two of them would be redundant.
+        if let Some(field) = &fields.base_field {
             return bail!(
                 field.name.span(),
-                "#[class(abstract)] classes must not declare #[var] or #[export] fields; abstract classes hold no instance state",
+                "a class deriving the Rust class `{base_path}` must not declare its own Base<T> field; it is inherited from `{base_path}`",
             );
         }
     }
@@ -125,14 +136,15 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
     };
 
     // Extra items only needed when deriving from a Rust base class.
-    let user_base_items = match &struct_cfg.user_base {
-        Some(user_base) => {
+    let user_base_items = match (&struct_cfg.user_base, &fields.rust_base_field) {
+        (Some(user_base), Some(rust_base_field)) => {
             let base_path = &user_base.path;
-            modifiers.push(quote! { with_godot_parent::<#base_path> });
+            let field_name = &rust_base_field.name;
+            modifiers.push(quote! { with_user_base::<#class_name> });
 
             quote! {
-                // Only abstract classes may be inherited: a concrete Rust class has instance state and methods registered for *its* struct,
-                // which a subclass object would not have. See the `#[class(abstract)]` docs.
+                // Only abstract classes may be inherited: a concrete Rust class is instantiated by Godot in its own right, and its members
+                // are registered for its own struct. See the `#[class(abstract)]` docs.
                 const _: () = assert!(
                     <#base_path as ::godot::obj::GodotClass>::__IS_ABSTRACT,
                     "#[class(base = ...)] with a Rust base class requires that class to be declared #[class(abstract)]",
@@ -140,10 +152,52 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
 
                 impl ::godot::obj::GodotParentOf for #class_name {
                     type Parent = #base_path;
+
+                    fn __embedded_base(&self) -> &#base_path {
+                        &self.#field_name
+                    }
+
+                    fn __embedded_base_mut(&mut self) -> &mut #base_path {
+                        &mut self.#field_name
+                    }
                 }
             }
         }
-        None => TokenStream::new(),
+        _ => TokenStream::new(),
+    };
+
+    // Only abstract classes can serve as a Rust base class, so only they need the chain walker that registers each ancestor's members for
+    // a concrete subclass. It requires the class to have a `#[godot_api]` impl block, which provides `RustBaseMembers`.
+    let rust_base_chain = if !struct_cfg.is_abstract {
+        TokenStream::new()
+    } else {
+        let chain = match &struct_cfg.user_base {
+            Some(user_base) => {
+                let base_path = &user_base.path;
+                quote! {
+                    <#base_path as ::godot::obj::RustBaseChain>::__register_all::<
+                        T,
+                        ::godot::obj::ThenBase<P, Self>,
+                    >();
+                }
+            }
+            None => TokenStream::new(),
+        };
+
+        quote! {
+            impl ::godot::obj::RustBaseChain for #class_name {
+                fn __register_all<T, P>()
+                where
+                    T: ::godot::obj::GodotClass
+                        + ::godot::obj::Bounds<Declarer = ::godot::obj::bounds::DeclUser>,
+                    P: ::godot::obj::RustBaseProjection<T, Self>,
+                {
+                    <Self as ::godot::obj::RustBaseMembers>::__register_own_methods::<T, P>();
+                    Self::__godot_register_exports_for_subclass::<T, P>();
+                    #chain
+                }
+            }
+        }
     };
 
     // `GodotClass::inherits()` walks `Base`, which skips Rust base classes -- override it to walk the Godot parent chain instead.
@@ -175,9 +229,9 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         TokenStream::new()
     };
 
-    let godot_exports_impl = make_property_impl(class_name, &fields);
+    let godot_exports_impl = make_property_impl(class_name, &fields, struct_cfg.is_abstract);
 
-    let godot_withbase_impl = make_with_base_impl(&fields.base_field, class_name);
+    let godot_withbase_impl = make_with_base_impl(&fields, class_name);
 
     let (user_singleton_impl, singleton_init_level_const) = if struct_cfg.is_singleton {
         modifiers.push(quote! { with_singleton::<#class_name> });
@@ -186,12 +240,8 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         (TokenStream::new(), TokenStream::new())
     };
 
-    let (user_class_impl, has_default_virtual) = make_user_class_impl(
-        class_name,
-        &struct_cfg.base_ty,
-        struct_cfg.is_tool,
-        &fields.all_fields,
-    );
+    let (user_class_impl, has_default_virtual) =
+        make_user_class_impl(class_name, &struct_cfg.base_ty, struct_cfg.is_tool, &fields);
 
     let mut init_expecter = TokenStream::new();
     let mut godot_init_impl = TokenStream::new();
@@ -218,6 +268,12 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
         }
         InitStrategy::Absent => {
             is_instantiable = false;
+
+            // An abstract class is never constructed by Godot, but its subclasses construct the embedded base instance -- so it still needs
+            // a Rust-level constructor. No `with_generated` modifier, hence no Godot-side constructor.
+            if struct_cfg.is_abstract {
+                godot_init_impl = make_godot_init_impl(class_name, &fields);
+            }
 
             // Workaround for https://github.com/godot-rust/gdext/issues/874 before Godot 4.5.
             #[cfg(before_api = "4.5")]
@@ -249,7 +305,10 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
 
     // Note: one limitation is that macros don't work for `impl nested::MyClass` blocks.
     let visibility_macro = make_visibility_macro(class_name, class.vis_marker.as_ref());
-    let base_field_macro = make_base_field_macro(class_name, fields.base_field.is_some());
+    let base_field_macro = make_base_field_macro(
+        class_name,
+        fields.base_field.is_some() || fields.rust_base_field.is_some(),
+    );
     let deny_manual_init_macro = make_deny_manual_init_macro(class_name, struct_cfg.init_strategy);
 
     Ok(quote! {
@@ -301,6 +360,7 @@ pub fn derive_godot_class(item: venial::Item) -> ParseResult<TokenStream> {
 
         #inherits_macro_invocation
         #user_base_items
+        #rust_base_chain
         #own_inherits_macro
     })
 }
@@ -349,8 +409,24 @@ fn make_own_inherits_macro(
     }
 }
 
-fn make_with_base_impl(base_field: &Option<Field>, class_name: &Ident) -> TokenStream {
-    let Some(Field { name, ty, .. }) = base_field else {
+fn make_with_base_impl(fields: &Fields, class_name: &Ident) -> TokenStream {
+    // A class deriving a Rust base class reaches the engine-side `Base<T>` through the embedded base instance.
+    if let Some(Field { name, ty, .. }) = &fields.rust_base_field {
+        return quote_spanned! { ty.span()=>
+            impl ::godot::obj::WithBaseField for #class_name {
+                fn to_gd(&self) -> ::godot::obj::Gd<#class_name> {
+                    let base = <#class_name as ::godot::obj::WithBaseField>::base_field(self);
+                    base.__constructed_gd().cast()
+                }
+
+                fn base_field(&self) -> &::godot::obj::Base<<#class_name as ::godot::obj::GodotClass>::Base> {
+                    <#ty as ::godot::obj::WithBaseField>::base_field(&self.#name)
+                }
+            }
+        };
+    }
+
+    let Some(Field { name, ty, .. }) = &fields.base_field else {
         return TokenStream::new();
     };
 
@@ -573,6 +649,11 @@ fn make_godot_init_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
     let base_init = if let Some(Field { name, ty, .. }) = &fields.base_field {
         // Do not name `base` to avoid tripping clippy::redundant_field_names when resulting user code is { base: base, ... }.
         quote_spanned! { ty.span()=> #name: base_param, }
+    } else if let Some(Field { name, ty, .. }) = &fields.rust_base_field {
+        // The embedded base instance takes over the `Base<T>` handle; it is constructed like a standalone instance of the base class.
+        quote_spanned! { ty.span()=>
+            #name: <#ty as ::godot::obj::cap::GodotDefault>::__godot_user_init(base_param),
+        }
     } else {
         TokenStream::new()
     };
@@ -678,8 +759,18 @@ fn make_user_class_impl(
     class_name: &Ident,
     trait_base_class: &Ident,
     is_tool: bool,
-    all_fields: &[Field],
+    fields: &Fields,
 ) -> (TokenStream, bool) {
+    let all_fields = &fields.all_fields;
+
+    // A Rust base class may itself have OnReady/OnEditor fields and `#[rpc]`s; run its hook first, like a constructor chain.
+    let rust_base_before_ready = match &fields.rust_base_field {
+        Some(Field { name, .. }) => quote! {
+            ::godot::obj::UserClass::__before_ready(&mut self.#name);
+        },
+        None => TokenStream::new(),
+    };
+
     #[cfg(feature = "codegen-full")]
     let rpc_registrations =
         quote! { ::godot::register::private::auto_register_rpcs::<#class_name>(self); };
@@ -695,8 +786,10 @@ fn make_user_class_impl(
     let needs_rpc_registration =
         cfg!(feature = "codegen-full") && crate::class::is_possibly_node_class(trait_base_class);
 
-    let run_before_ready =
-        !onready_inits.is_empty() || !oneditor_panic_inits.is_empty() || needs_rpc_registration;
+    let run_before_ready = !onready_inits.is_empty()
+        || !oneditor_panic_inits.is_empty()
+        || needs_rpc_registration
+        || !rust_base_before_ready.is_empty();
 
     let default_virtual_fn = if run_before_ready {
         let tool_check = util::make_virtual_tool_check();
@@ -755,6 +848,7 @@ fn make_user_class_impl(
 
             #[doc(hidden)]
             fn __before_ready(&mut self) {
+                #rust_base_before_ready
                 #oneditor_panic_inits
                 #rpc_registrations
                 #onready_inits
@@ -967,10 +1061,12 @@ fn parse_base_expr(expr: TokenStream) -> ParseResult<(Ident, Option<UserBase>)> 
 /// Returns field names and 1 base field, if available.
 fn parse_fields(
     named_fields: Vec<(venial::NamedField, Punct)>,
-    init_strategy: InitStrategy,
+    generates_godot_default: bool,
+    user_base_ty: Option<&Ident>,
 ) -> ParseResult<Fields> {
     let mut all_fields = vec![];
     let mut base_field = Option::<Field>::None;
+    let mut rust_base_field = Option::<Field>::None;
     #[allow(unused_mut)] // Less chore when adding/removing deprecations.
     let mut deprecations = vec![];
     let mut errors = vec![];
@@ -979,11 +1075,19 @@ fn parse_fields(
     // Attributes on struct fields
     for (named_field, _punct) in named_fields {
         let mut is_base = false;
+        let mut is_rust_base = false;
         let mut field = Field::new(&named_field);
 
         // Base<T> type inference
         if path_ends_with_complex(&field.ty, "Base") {
             is_base = true;
+        }
+
+        // Embedded base class instance, for `#[class(base = SomeRustClass)]`: the field whose type is that class.
+        if let Some(user_base_ty) = user_base_ty
+            && path_ends_with_complex(&field.ty, &user_base_ty.to_string())
+        {
+            is_rust_base = true;
         }
 
         // OnReady<T> type inference
@@ -1004,7 +1108,7 @@ fn parse_fields(
         // #[init]
         if let Some(mut parser) = KvParser::parse(&named_field.attributes, "init")? {
             // #[init] on fields is useless if there is no generated constructor.
-            if !matches!(init_strategy, InitStrategy::Generated) {
+            if !generates_godot_default {
                 return bail!(
                     parser.span(),
                     "field attribute #[init] requires struct attribute #[class(init)]"
@@ -1143,7 +1247,15 @@ fn parse_fields(
         }
 
         // Extra validation; eventually assign to base_fields or all_fields.
-        if is_base {
+        if is_rust_base {
+            if let Some(prev) = rust_base_field.replace(field) {
+                errors.push(error!(
+                    named_field,
+                    "at most 1 field can hold the embedded base class instance; previous is `{}`",
+                    prev.name
+                ));
+            }
+        } else if is_base {
             validate_base_field(&field, &mut errors);
 
             if let Some(prev_base) = base_field.replace(field) {
@@ -1166,6 +1278,7 @@ fn parse_fields(
     Ok(Fields {
         all_fields,
         base_field,
+        rust_base_field,
         deprecations,
         errors,
         has_tool_button,

@@ -8,7 +8,7 @@
 //! Parses the `#[var]` and `#[export]` attributes on fields.
 
 use proc_macro2::{Ident, TokenStream};
-use quote::quote;
+use quote::{ToTokens, quote};
 
 use crate::class::data_models::fields::Fields;
 use crate::class::data_models::group_export::FieldGroup;
@@ -40,11 +40,15 @@ impl FieldHint {
     }
 }
 
-pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
+pub fn make_property_impl(class_name: &Ident, fields: &Fields, is_abstract: bool) -> TokenStream {
     let mut getter_setter_impls = Vec::new();
     let mut phantom_var_dummy_uses = Vec::new();
     let mut func_name_consts = Vec::new();
     let mut export_tokens = Vec::new();
+
+    // Same registrations, but installed on a concrete subclass when this class is used as a Rust base class. See `RustBaseChain`.
+    let subclass_ty = ident("T");
+    let mut export_tokens_for_subclass = Vec::new();
 
     for field in &fields.all_fields {
         let Field {
@@ -76,6 +80,12 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
         };
 
         make_groups_registrations(group, subgroup, &mut export_tokens, class_name);
+        make_groups_registrations(
+            group,
+            subgroup,
+            &mut export_tokens_for_subclass,
+            &subclass_ty,
+        );
         let FieldVar {
             rename,
             getter,
@@ -151,6 +161,7 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
             &mut getter_setter_impls,
             &mut func_name_consts,
             &mut export_tokens,
+            &mut export_tokens_for_subclass,
             class_name,
         );
         let setter_func_constant = make_accessor_func_constant(
@@ -158,6 +169,7 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
             &mut getter_setter_impls,
             &mut func_name_consts,
             &mut export_tokens,
+            &mut export_tokens_for_subclass,
             class_name,
         );
 
@@ -168,17 +180,22 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
             });
         }
 
-        export_tokens.push(quote! {
-            // This type may be reused in #hint, in case of generic functions.
-            type FieldType = #field_type;
-            ::godot::register::private::#registration_fn::<#class_name, FieldType>(
-                #field_name,
-                #getter_func_constant,
-                #setter_func_constant,
-                #hint,
-                #usage_flags,
-            );
-        });
+        let registration = |owner: &dyn ToTokens| {
+            quote! {
+                // This type may be reused in #hint, in case of generic functions.
+                type FieldType = #field_type;
+                ::godot::register::private::#registration_fn::<#owner, FieldType>(
+                    #field_name,
+                    #getter_func_constant,
+                    #setter_func_constant,
+                    #hint,
+                    #usage_flags,
+                );
+            }
+        };
+
+        export_tokens.push(registration(&class_name));
+        export_tokens_for_subclass.push(registration(&subclass_ty));
     }
 
     let phantom_var_dummy_use_fn = if phantom_var_dummy_uses.is_empty() {
@@ -196,6 +213,21 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
         }
     };
 
+    // An abstract class's properties are registered for each of its concrete subclasses instead (through
+    // `__godot_register_exports_for_subclass()`); registering them here as well would list them twice in the inspector, and the accessor
+    // method binds on the abstract class would never be reachable.
+    let own_export_tokens = if is_abstract {
+        TokenStream::new()
+    } else {
+        quote! {
+            #(
+                {
+                    #export_tokens
+                }
+            )*
+        }
+    };
+
     // For each generated #[func], add a const declaration.
     // This is the name of the container struct, which is declared by #[derive(GodotClass)].
     let class_functions_name = format_funcs_collection_struct(class_name);
@@ -204,6 +236,25 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
         impl #class_name {
             #(#getter_setter_impls)*
             #phantom_var_dummy_use_fn
+
+            /// Registers this class's properties for a concrete subclass, projecting through the embedded base instance.
+            ///
+            /// Called by the `RustBaseChain` implementation; a no-op unless this class is used as a Rust base class.
+            #[doc(hidden)]
+            pub fn __godot_register_exports_for_subclass<T, P>()
+            where
+                T: ::godot::obj::GodotClass
+                    + ::godot::obj::Bounds<Declarer = ::godot::obj::bounds::DeclUser>,
+                P: ::godot::obj::RustBaseProjection<T, Self>,
+            {
+                // Inherited accessors are registered for the subclass `T`, not for the declaring class.
+                let __godot_class_id = <T as ::godot::obj::GodotClass>::class_id();
+                #(
+                    {
+                        #export_tokens_for_subclass
+                    }
+                )*
+            }
         }
 
         impl #class_functions_name {
@@ -214,11 +265,7 @@ pub fn make_property_impl(class_name: &Ident, fields: &Fields) -> TokenStream {
             fn __register_exports() {
                 // Outside per-accessor registration; would otherwise emit this call once per property.
                 let __godot_class_id = <#class_name as ::godot::obj::GodotClass>::class_id();
-                #(
-                    {
-                        #export_tokens
-                    }
-                )*
+                #own_export_tokens
             }
         }
     }
@@ -232,6 +279,7 @@ fn make_accessor_func_constant(
     getter_setter_impls: &mut Vec<TokenStream>,
     func_name_consts: &mut Vec<TokenStream>,
     export_tokens: &mut Vec<TokenStream>,
+    export_tokens_for_subclass: &mut Vec<TokenStream>,
     class_name: &Ident,
 ) -> TokenStream {
     let Some(gs) = getter_setter_impl else {
@@ -241,6 +289,10 @@ fn make_accessor_func_constant(
     getter_setter_impls.push(gs.function_impl);
     func_name_consts.push(gs.funcs_collection_constant);
     export_tokens.push(gs.export_token);
+
+    if !gs.export_token_for_subclass.is_empty() {
+        export_tokens_for_subclass.push(gs.export_token_for_subclass);
+    }
 
     // Getters/setters are, like #[func]s, subject to additional code generation: a constant inside a "funcs collection" struct
     // stores their Godot name and can be used as an indirection to refer to their true name from other procedural macros.

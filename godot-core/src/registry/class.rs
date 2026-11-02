@@ -121,6 +121,8 @@ struct ClassRegistrationInfo {
     parent_class_id: Option<ClassId>,
     /// `#[func(abstract)]` methods declared by this class; subclasses must implement them.
     abstract_method_names: &'static [&'static str],
+    /// Registers the members inherited from a Rust base class chain, if any.
+    register_inherited_fn: Option<fn()>,
     // Following functions are stored separately, since their order matters.
     register_methods_constants_fn: Option<ErasedRegisterFn>,
     register_properties_fn: Option<ErasedRegisterFn>,
@@ -207,6 +209,7 @@ pub(crate) fn register_class<
         class_id: T::class_id(),
         parent_class_id: Some(T::Base::class_id()),
         abstract_method_names: &[],
+        register_inherited_fn: None,
         register_methods_constants_fn: None,
         register_properties_fn: None,
         user_register_fn: Some(ErasedRegisterFn {
@@ -530,6 +533,7 @@ fn fill_class_info(item: ShardItem, c: &mut ClassRegistrationInfo) {
             is_internal,
             is_instantiable,
             is_abstract,
+            register_inherited_fn,
             reference_fn,
             unreference_fn,
         }) => {
@@ -554,6 +558,7 @@ fn fill_class_info(item: ShardItem, c: &mut ClassRegistrationInfo) {
             // `#[class(abstract)]` maps to Godot's "virtual" flag, which is what Godot calls an abstract base class
             // (see GDREGISTER_VIRTUAL_CLASS). `ClassDb::can_instantiate()` returns false for those.
             c.godot_params.is_virtual = sys::conv::bool_to_sys(is_abstract);
+            c.register_inherited_fn = register_inherited_fn;
             c.godot_params.free_instance_func = Some(free_fn);
             c.godot_params.reference_func = reference_fn;
             c.godot_params.unreference_func = unreference_fn;
@@ -727,6 +732,12 @@ fn register_class_raw(mut info: ClassRegistrationInfo) {
         (register_fn.raw)(&mut class_builder);
     }
 
+    // Members inherited from a Rust base class, registered for this class with a projection to the embedded base instance. Before the own
+    // properties, so that inherited accessor methods exist by the time any property refers to them.
+    if let Some(register_fn) = info.register_inherited_fn {
+        register_fn();
+    }
+
     if let Some(register_fn) = info.register_properties_fn {
         (register_fn.raw)(&mut class_builder);
     }
@@ -801,6 +812,7 @@ fn default_registration_info(class_id: ClassId) -> ClassRegistrationInfo {
         class_id,
         parent_class_id: None,
         abstract_method_names: &[],
+        register_inherited_fn: None,
         register_methods_constants_fn: None,
         register_properties_fn: None,
         user_register_fn: None,

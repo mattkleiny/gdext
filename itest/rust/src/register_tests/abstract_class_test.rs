@@ -19,11 +19,19 @@ use crate::framework::{expect_panic, itest};
 // ----------------------------------------------------------------------------------------------------------------------------------------------
 // Declarations: abstract base class, two concrete subclasses
 
-/// Abstract base class: cannot be instantiated, declares two abstract methods.
+/// Abstract base class: cannot be instantiated, holds instance state, declares concrete and abstract methods.
 #[derive(GodotClass)]
 #[class(abstract, base = Resource)]
 pub struct AbstractShape {
-    _base: Base<Resource>,
+    base: Base<Resource>,
+
+    /// Base-class state, inherited by every subclass.
+    #[var]
+    #[init(val = 1.0)]
+    scale: f64,
+
+    #[var]
+    label: GString,
 }
 
 #[godot_api]
@@ -34,6 +42,25 @@ impl AbstractShape {
 
     #[func(abstract)]
     fn scaled_name(&mut self, factor: i64) -> GString;
+
+    /// Concrete base method, operating on base-class state. Inherited by every subclass.
+    #[func]
+    fn describe(&self) -> GString {
+        GString::from(&format!("{} @{}", self.label, self.scale))
+    }
+
+    /// Concrete base method with `&mut self`.
+    #[func]
+    fn grow(&mut self, by: f64) -> f64 {
+        self.scale += by;
+        self.scale
+    }
+
+    /// Base methods can use the inherited `Base<T>` handle.
+    #[func]
+    fn base_class_name(&self) -> GString {
+        GString::from(&self.base().get_class().to_string())
+    }
 
     /// Statics are fine on abstract classes: they ignore the instance pointer.
     #[func]
@@ -48,9 +75,10 @@ impl AbstractShape {
 #[derive(GodotClass)]
 #[class(init, base = AbstractShape)]
 pub struct Circle {
+    shape: AbstractShape,
+
     #[var]
     radius: f64,
-    _base: Base<Resource>,
 }
 
 #[godot_api]
@@ -58,6 +86,12 @@ impl Circle {
     #[func]
     fn circumference(&self) -> f64 {
         2.0 * std::f64::consts::PI * self.radius
+    }
+
+    /// Rust-side access to the base class's state.
+    #[func]
+    fn scaled_area(&self) -> f64 {
+        self.area() * self.shape.scale
     }
 }
 
@@ -76,9 +110,10 @@ impl IAbstractShape for Circle {
 #[derive(GodotClass)]
 #[class(init, base = AbstractShape)]
 pub struct Square {
+    shape: AbstractShape,
+
     #[var]
     side: f64,
-    _base: Base<Resource>,
 }
 
 #[godot_api]
@@ -100,31 +135,50 @@ impl IAbstractShape for Square {
 #[derive(GodotClass)]
 #[class(abstract, base = Node)]
 pub struct AbstractActor {
-    _base: Base<Node>,
+    base: Base<Node>,
+
+    #[var]
+    #[init(val = 10)]
+    health: i64,
 }
 
 #[godot_api]
 impl AbstractActor {
     #[func(abstract)]
     fn actor_name(&self) -> GString;
+
+    #[func]
+    fn take_damage(&mut self, amount: i64) -> i64 {
+        self.health -= amount;
+        self.health
+    }
 }
 
 #[derive(GodotClass)]
 #[class(abstract, base = AbstractActor)]
 pub struct AbstractEnemy {
-    _base: Base<Node>,
+    actor: AbstractActor,
+
+    #[var]
+    #[init(val = 1)]
+    threat: i64,
 }
 
 #[godot_api]
 impl AbstractEnemy {
     #[func(abstract)]
     fn damage(&self) -> i64;
+
+    #[func]
+    fn threat_level(&self) -> i64 {
+        self.threat * self.actor.health
+    }
 }
 
 #[derive(GodotClass)]
 #[class(init, base = AbstractEnemy)]
 pub struct Goblin {
-    _base: Base<Node>,
+    enemy: AbstractEnemy,
 }
 
 #[godot_api]
@@ -407,6 +461,146 @@ fn abstract_class_engine_virtual_runs() {
 
     root.remove_child(&goblin);
     goblin.free();
+}
+
+// ----------------------------------------------------------------------------------------------------------------------------------------------
+// Base-class state and concrete base methods
+
+#[itest]
+fn base_class_state_inherited() {
+    let circle = Circle::new_gd();
+
+    // Base-class fields are reachable from Rust through the embedded base instance.
+    assert_eq!(circle.bind().shape.scale, 1.0, "#[init(val)] on base field");
+
+    // ...and as Godot properties of the *subclass*.
+    let mut object = circle.clone().upcast::<Object>();
+    object.set("scale", &2.5.to_variant());
+    assert_eq!(circle.bind().shape.scale, 2.5);
+    assert_eq!(object.get("scale").to::<f64>(), 2.5);
+
+    object.set("label", &"ring".to_variant());
+    assert_eq!(circle.bind().shape.label, "ring");
+}
+
+#[itest]
+fn base_class_concrete_method_inherited() {
+    let mut circle = Circle::new_gd();
+    {
+        let mut guard = circle.bind_mut();
+        guard.shape.scale = 3.0;
+        guard.shape.label = "ring".into();
+    }
+
+    let mut object = circle.clone().upcast::<Object>();
+
+    // `&self` base method, operating on base state.
+    assert_eq!(object.call("describe", &[]).to::<GString>(), "ring @3");
+
+    // `&mut self` base method.
+    assert_eq!(object.call("grow", &[0.5.to_variant()]).to::<f64>(), 3.5);
+    assert_eq!(circle.bind().shape.scale, 3.5);
+
+    // The base method sees the inherited `Base<T>` handle, whose dynamic class is the subclass.
+    assert_eq!(
+        object.call("base_class_name", &[]).to::<GString>(),
+        "Circle"
+    );
+}
+
+#[itest]
+fn base_class_method_registered_on_subclass_only() {
+    let class_db = ClassDb::singleton();
+
+    // The abstract class's own methods and properties are registered for each concrete subclass, not for itself -- otherwise properties
+    // would appear twice in the inspector, and the base's method binds would receive instances of the wrong type.
+    assert!(class_db.class_has_method("Circle", "describe"));
+    assert!(class_db.class_has_method("Square", "describe"));
+    assert!(!class_db.class_has_method("AbstractShape", "describe"));
+
+    let own_props = class_db
+        .class_get_property_list_ex("Circle")
+        .no_inheritance(true)
+        .done();
+    let scale_count = own_props
+        .iter_shared()
+        .filter(|dict| dict.at("name").to::<GString>() == "scale")
+        .count();
+    assert_eq!(scale_count, 1, "inherited property registered exactly once");
+}
+
+#[itest]
+fn base_class_state_is_per_instance() {
+    let circle = Circle::new_gd();
+    let square = Square::new_gd();
+
+    circle
+        .clone()
+        .upcast::<Object>()
+        .set("scale", &2.0.to_variant());
+
+    assert_eq!(circle.bind().shape.scale, 2.0);
+    assert_eq!(square.bind().shape.scale, 1.0, "siblings are independent");
+}
+
+#[itest]
+fn base_class_reentrant_borrow() {
+    // The projection borrows through the *subclass*'s GdCell, so a base method called from a subclass method must not alias.
+    let mut circle = Circle::new_gd();
+    circle.bind_mut().radius = 2.0;
+
+    let mut object = circle.clone().upcast::<Object>();
+    let area = object.call("scaled_area", &[]).to::<f64>();
+    assert!((area - std::f64::consts::PI * 4.0).abs() < 1e-9);
+}
+
+#[itest]
+fn base_class_multilevel_state_and_methods() {
+    let goblin = Goblin::new_alloc();
+
+    {
+        let guard = goblin.bind();
+        assert_eq!(guard.enemy.threat, 1);
+        assert_eq!(guard.enemy.actor.health, 10);
+    }
+
+    let mut object = goblin.clone().upcast::<Object>();
+
+    // Method from the direct base...
+    assert_eq!(object.call("threat_level", &[]).to::<i64>(), 10);
+
+    // ...and from the grandparent.
+    assert_eq!(object.call("take_damage", &[4.to_variant()]).to::<i64>(), 6);
+    assert_eq!(goblin.bind().enemy.actor.health, 6);
+
+    // Properties from both levels.
+    assert_eq!(object.get("health").to::<i64>(), 6);
+    assert_eq!(object.get("threat").to::<i64>(), 1);
+
+    goblin.free();
+}
+
+#[itest]
+fn base_class_multilevel_property_registration() {
+    let class_db = ClassDb::singleton();
+
+    // Both ancestors' members land on the concrete class, once each.
+    assert!(class_db.class_has_method("Goblin", "take_damage"));
+    assert!(class_db.class_has_method("Goblin", "threat_level"));
+    assert!(!class_db.class_has_method("AbstractActor", "take_damage"));
+
+    let own_props = class_db
+        .class_get_property_list_ex("Goblin")
+        .no_inheritance(true)
+        .done();
+
+    for name in ["health", "threat"] {
+        let count = own_props
+            .iter_shared()
+            .filter(|dict| dict.at("name").to::<GString>() == name)
+            .count();
+        assert_eq!(count, 1, "property `{name}` registered exactly once");
+    }
 }
 
 #[itest]

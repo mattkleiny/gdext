@@ -108,6 +108,7 @@ pub fn transform_abstract_trait_impl(impl_block: venial::Impl) -> ParseResult<To
                 let mut guard = #class_name::__registration_storage().lock().unwrap();
 
                 guard.0.push(|| {
+                    let __godot_class_id = <#class_name as ::godot::obj::GodotClass>::class_id();
                     #( #method_registrations )*
                 });
             });

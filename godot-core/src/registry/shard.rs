@@ -11,8 +11,8 @@ use std::{any, fmt};
 use crate::init::InitLevel;
 use crate::meta::ClassId;
 use crate::obj::{
-    Bounds, DynGd, Gd, GodotClass, Inherits, NewAlloc, Singleton, UserClass, UserSingleton, bounds,
-    cap,
+    Bounds, DirectBase, DynGd, Gd, GodotClass, GodotParentOf, Inherits, NewAlloc, RustBaseChain,
+    Singleton, UserClass, UserSingleton, bounds, cap,
 };
 use crate::registry::callbacks;
 use crate::registry::class::GodotGetVirtual;
@@ -209,6 +209,9 @@ pub struct Struct {
     ///
     /// Registered as "virtual" in Godot terms, meaning an abstract base class (`ClassDb::can_instantiate()` returns false).
     pub(crate) is_abstract: bool,
+
+    /// For `#[class(base = SomeRustClass)]`: registers the members inherited from the Rust base class chain for this class.
+    pub(crate) register_inherited_fn: Option<fn()>,
 }
 
 impl Struct {
@@ -231,6 +234,7 @@ impl Struct {
             is_internal: false,
             is_instantiable: false,
             is_abstract: false,
+            register_inherited_fn: None,
             // While Godot doesn't do anything with these callbacks for non-RefCounted classes, we can avoid instantiating them in Rust.
             reference_fn: refcounted.then_some(callbacks::reference::<T>),
             unreference_fn: refcounted.then_some(callbacks::unreference::<T>),
@@ -312,12 +316,28 @@ impl Struct {
         self
     }
 
-    /// `#[class(base = SomeUserClass)]` -- overrides the Godot-side parent class.
+    /// `#[class(base = SomeUserClass)]` -- sets the Godot-side parent class and registers the inherited members.
     ///
     /// For classes deriving from a *user* class, `GodotClass::Base` is the nearest *engine* base (so that engine virtual methods keep
     /// working), while the class registered as parent in Godot is the user base class.
-    pub fn with_godot_parent<B: GodotClass>(mut self) -> Self {
-        self.base_class_id = B::class_id();
+    ///
+    /// The base class's `#[func]`s and properties are registered for *this* class, projecting through the embedded base field; see
+    /// [`RustBaseChain`].
+    pub fn with_user_base<T>(mut self) -> Self
+    where
+        T: GodotParentOf + Bounds<Declarer = bounds::DeclUser>,
+        T::Parent: RustBaseChain,
+    {
+        self.base_class_id = T::Parent::class_id();
+
+        // Only *concrete* classes get the inherited members: an abstract class has no instances, and registering them there too would
+        // shadow the concrete subclass's own registrations. The chain is walked in full from each concrete class.
+        self.register_inherited_fn = if T::__IS_ABSTRACT {
+            None
+        } else {
+            Some(|| <T::Parent as RustBaseChain>::__register_all::<T, DirectBase>())
+        };
+
         self
     }
 }

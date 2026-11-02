@@ -11,6 +11,7 @@ use quote::{TokenStreamExt, format_ident, quote};
 use crate::class::FuncDefinition;
 
 /// Possible ways the user can specify RPC configuration.
+#[derive(Clone)]
 pub enum RpcAttr {
     // Individual keys in the `rpc` attribute.
     // Example: `#[rpc(any_peer, reliable, call_remote, channel = 3)]`

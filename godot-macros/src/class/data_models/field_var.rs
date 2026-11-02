@@ -10,8 +10,8 @@ use quote::{ToTokens, format_ident, quote, quote_spanned};
 use venial::TypeExpr;
 
 use crate::class::{
-    Field, FieldHint, FuncDefinition, into_signature_info, make_accessor_type_check,
-    make_method_registration,
+    Field, FieldHint, FuncDefinition, Projection, into_signature_info, make_accessor_type_check,
+    make_inherited_method_registration, make_method_registration,
 };
 use crate::util::{KvParser, ident, make_funcs_collection_constant};
 use crate::{ParseResult, util};
@@ -286,6 +286,10 @@ pub struct GetterSetterImpl {
     pub rust_accessor: Ident,
     pub function_impl: TokenStream,
     pub export_token: TokenStream,
+    /// Same registration, but for a concrete subclass of this class, projecting through the embedded base instance.
+    ///
+    /// Empty for user-defined accessors: those are ordinary `#[func]`s, already registered through `RustBaseMembers`.
+    pub export_token_for_subclass: TokenStream,
     pub funcs_collection_constant: TokenStream,
 }
 
@@ -383,13 +387,14 @@ impl GetterSetterImpl {
             #deprecated_function
         };
 
-        let (funcs_collection_constant, export_token) =
+        let (funcs_collection_constant, export_token, export_token_for_subclass) =
             Self::make_registration(class_name, &rust_accessor, &godot_function_name, signature);
 
         Self {
             rust_accessor,
             function_impl,
             export_token,
+            export_token_for_subclass,
             funcs_collection_constant,
         }
     }
@@ -427,26 +432,27 @@ impl GetterSetterImpl {
             }
         };
 
-        let (funcs_collection_constant, export_token) =
+        let (funcs_collection_constant, export_token, export_token_for_subclass) =
             Self::make_registration(class_name, &rust_accessor, &godot_function_name, signature);
 
         Self {
             rust_accessor,
             function_impl,
             export_token,
+            export_token_for_subclass,
             funcs_collection_constant,
         }
     }
 
     /// Registers a generated accessor with Godot. Shared by `from_generated_impl` and `from_write_only_getter`.
     ///
-    /// Returns `(funcs_collection_constant, export_token)`.
+    /// Returns `(funcs_collection_constant, export_token, export_token_for_subclass)`.
     fn make_registration(
         class_name: &Ident,
         rust_accessor: &Ident,
         godot_function_name: &Ident,
         signature: TokenStream,
-    ) -> (TokenStream, TokenStream) {
+    ) -> (TokenStream, TokenStream, TokenStream) {
         let funcs_collection_constant = make_funcs_collection_constant(
             class_name,
             rust_accessor,
@@ -455,28 +461,36 @@ impl GetterSetterImpl {
         );
 
         let signature = util::parse_signature(signature);
-        let export_token = make_method_registration(
+        let func_definition = FuncDefinition {
+            signature_info: into_signature_info(signature, class_name, false),
+            // Since we're analyzing a struct's field, we don't have access to the corresponding get/set function's external (non-#[func])
+            // attributes. We have to assume the function exists and has the name the user gave us, with the expected signature.
+            // Ideally, we'd be able to place #[cfg_attr] on #[var(get)] and #[var(set)] to be able to match a #[cfg()] (for instance)
+            // placed on the getter/setter function, but that is not currently supported.
+            external_attributes: Vec::new(),
+            // The Rust function name may differ from the Godot name (e.g. `__godot_get_field` vs `get_field`).
+            registered_name: Some(godot_function_name.to_string()),
+            is_script_virtual: false,
+            is_abstract: false,
+            rpc_info: None,
+            is_generated_accessor: true,
+        };
+
+        let export_token = make_method_registration(class_name, func_definition.clone(), None)
+            .expect("accessor registration should not fail");
+
+        let export_token_for_subclass = make_inherited_method_registration(
             class_name,
-            FuncDefinition {
-                signature_info: into_signature_info(signature, class_name, false),
-                // Since we're analyzing a struct's field, we don't have access to the corresponding get/set function's external (non-#[func])
-                // attributes. We have to assume the function exists and has the name the user gave us, with the expected signature.
-                // Ideally, we'd be able to place #[cfg_attr] on #[var(get)] and #[var(set)] to be able to match a #[cfg()] (for instance)
-                // placed on the getter/setter function, but that is not currently supported.
-                external_attributes: Vec::new(),
-                // The Rust function name may differ from the Godot name (e.g. `__godot_get_field` vs `get_field`).
-                registered_name: Some(godot_function_name.to_string()),
-                is_script_virtual: false,
-                is_abstract: false,
-                rpc_info: None,
-                is_generated_accessor: true,
-            },
-            None,
-        );
+            func_definition,
+            &Projection::generic_params(),
+        )
+        .expect("inherited accessor registration should not fail");
 
-        let export_token = export_token.expect("accessor registration should not fail");
-
-        (funcs_collection_constant, export_token)
+        (
+            funcs_collection_constant,
+            export_token,
+            export_token_for_subclass,
+        )
     }
 
     // Nice-named function emitted alongside the registered (`Via`) accessor. For `#[var(pub)]`, an ergonomic `PubType` accessor;
@@ -590,6 +604,7 @@ impl GetterSetterImpl {
             rust_accessor: function_name.clone(),
             function_impl: TokenStream::new(),
             export_token,
+            export_token_for_subclass: TokenStream::new(),
             funcs_collection_constant: TokenStream::new(),
         }
     }
@@ -608,6 +623,7 @@ impl GetterSetterImpl {
             rust_accessor: function_name,
             function_impl: TokenStream::new(),
             export_token,
+            export_token_for_subclass: TokenStream::new(),
             funcs_collection_constant: TokenStream::new(),
         }
     }

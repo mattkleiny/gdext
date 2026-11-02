@@ -11,9 +11,9 @@ use quote::{ToTokens, format_ident, quote};
 
 use crate::class::data_models::func;
 use crate::class::{
-    ConstDefinition, FuncDefinition, ReceiverType, RpcAttr, RpcMode, SignalDefinition,
+    ConstDefinition, FuncDefinition, Projection, ReceiverType, RpcAttr, RpcMode, SignalDefinition,
     SignatureInfo, TransferMode, into_signature_info, make_constant_registration,
-    make_method_registration, make_signal_registrations,
+    make_inherited_method_registration, make_method_registration, make_signal_registrations,
 };
 use crate::util::{
     KvParser, bail, c_str, format_funcs_collection_struct, ident, make_funcs_collection_constants,
@@ -106,7 +106,7 @@ pub fn transform_inherent_impl(
         process_godot_fns(&class_name, &mut impl_block, meta.secondary)?;
     let consts = process_godot_constants(&mut impl_block)?;
 
-    let abstract_items = make_abstract_items(&class_name, &funcs, &abstract_funcs);
+    let abstract_items = make_abstract_items(&class_name, &abstract_funcs);
 
     let inherent_impl_docs =
         crate::docs::make_trait_docs_registration(&funcs, &consts, &signals, &class_name, &prv);
@@ -152,6 +152,9 @@ pub fn transform_inherent_impl(
     let (rpc_registrations, rpc_api) =
         crate::class::make_rpc_registrations(&class_name, &funcs, meta.no_typed_rpcs);
 
+    // Registrations of this class's methods for each concrete subclass, used when the class serves as a Rust base class.
+    let rust_base_members = make_rust_base_members_impl(&class_name, &funcs, meta.secondary)?;
+
     // Names of `#[func(abstract)]` methods, so that registration can verify concrete subclasses implement them.
     let abstract_method_names = funcs
         .iter()
@@ -159,7 +162,20 @@ pub fn transform_inherent_impl(
         .map(|func| func.godot_name())
         .collect::<Vec<_>>();
 
-    let method_registrations: Vec<TokenStream> = funcs
+    // Abstract declarations are metadata on this class itself, and associated functions ignore the instance pointer -- both stay registered
+    // here unconditionally. An abstract class's *instance* methods are registered for each of its subclasses instead (see
+    // `RustBaseMembers`), so registering them here as well would duplicate them.
+    let (always_funcs, instance_funcs): (Vec<FuncDefinition>, Vec<FuncDefinition>) =
+        funcs.into_iter().partition(|func| {
+            func.is_abstract || func.signature_info.receiver_type == ReceiverType::Static
+        });
+
+    let always_method_registrations: Vec<TokenStream> = always_funcs
+        .into_iter()
+        .map(|func_def| make_method_registration(&class_name, func_def, None))
+        .collect::<ParseResult<Vec<TokenStream>>>()?;
+
+    let instance_method_registrations: Vec<TokenStream> = instance_funcs
         .into_iter()
         .map(|func_def| make_method_registration(&class_name, func_def, None))
         .collect::<ParseResult<Vec<TokenStream>>>()?;
@@ -174,7 +190,14 @@ pub fn transform_inherent_impl(
                 guard.0.push(|| {
                     // Outside per-method registration; would otherwise emit this call once per #[func].
                     let __godot_class_id = <#class_name as ::godot::obj::GodotClass>::class_id();
-                    #( #method_registrations )*
+                    #( #always_method_registrations )*
+
+                    // An abstract class's instance methods are registered for each of its subclasses instead (see `RustBaseMembers`);
+                    // registering them here as well would list them twice. Const-folded, so this costs nothing.
+                    if !<#class_name as ::godot::obj::GodotClass>::__IS_ABSTRACT {
+                        #( #instance_method_registrations )*
+                    }
+
                     #( #signal_registrations )*
                 });
 
@@ -242,6 +265,7 @@ pub fn transform_inherent_impl(
             #rpc_api
             #inherent_impl_docs
             #abstract_items
+            #rust_base_members
         };
 
         Ok(result)
@@ -508,29 +532,61 @@ fn process_godot_fns(
     Ok((func_definitions, signal_definitions, abstract_definitions))
 }
 
-/// Generates the `<Class>Abstract` trait for `#[func(abstract)]` declarations, plus compile-time checks tying `#[func(abstract)]` and
+/// Generates the `RustBaseMembers` impl: registers this class's instance methods for a concrete subclass, when the class is used as a
+/// Rust base class via `#[class(base = ThisClass)]`.
+///
+/// A base class has no instances of its own -- the Godot object holds the *subclass*'s struct, with the base's fields inside it. Each
+/// method is therefore registered for the subclass, with a closure projecting to that embedded instance.
+fn make_rust_base_members_impl(
+    class_name: &Ident,
+    funcs: &[FuncDefinition],
+    is_secondary_impl: bool,
+) -> ParseResult<TokenStream> {
+    // Only the primary block implements the trait; a type can have just one impl. Methods in secondary blocks are not inherited.
+    if is_secondary_impl {
+        return Ok(TokenStream::new());
+    }
+
+    let projection = Projection::generic_params();
+
+    // Associated functions ignore the instance pointer, so they stay registered on the base class and are inherited through ClassDB.
+    // Abstract methods have no implementation to dispatch to; the subclass registers its own.
+    // `#[func(gd_self)]` takes a `Gd<Self>`, which would be the subclass's -- not projectable, so it is not inherited.
+    let registrations = funcs
+        .iter()
+        .filter(|func| {
+            !func.is_abstract
+                && !matches!(
+                    func.signature_info.receiver_type,
+                    ReceiverType::Static | ReceiverType::GdSelf
+                )
+        })
+        .map(|func| make_inherited_method_registration(class_name, func.clone(), &projection))
+        .collect::<ParseResult<Vec<TokenStream>>>()?;
+
+    Ok(quote! {
+        impl ::godot::obj::RustBaseMembers for #class_name {
+            fn __register_own_methods<T, P>()
+            where
+                T: ::godot::obj::GodotClass
+                    + ::godot::obj::Bounds<Declarer = ::godot::obj::bounds::DeclUser>,
+                P: ::godot::obj::RustBaseProjection<T, Self>,
+            {
+                // Inherited methods are registered for the subclass `T`, not for the declaring class.
+                let __godot_class_id = <T as ::godot::obj::GodotClass>::class_id();
+                #( #registrations )*
+            }
+        }
+    })
+}
+
+/// Generates the `I<Class>` trait for `#[func(abstract)]` declarations, plus compile-time checks tying `#[func(abstract)]` and
 /// `#[class(abstract)]` together.
 fn make_abstract_items(
     class_name: &Ident,
-    funcs: &[FuncDefinition],
     abstract_funcs: &[AbstractFuncDefinition],
 ) -> TokenStream {
     let mut code = TokenStream::new();
-
-    // Concrete instance methods are registered for *this* class's struct; a subclass object holds a different struct, so such methods must
-    // never be inherited through `#[class(base = ThisClass)]`. Statics are fine, as they ignore the instance.
-    let has_concrete_instance_func = funcs
-        .iter()
-        .any(|func| !func.is_abstract && func.signature_info.receiver_type != ReceiverType::Static);
-
-    if has_concrete_instance_func {
-        code.extend(quote! {
-            const _: () = assert!(
-                !<#class_name as ::godot::obj::GodotClass>::__IS_ABSTRACT,
-                "#[class(abstract)] classes must not declare #[func]s with a `self` receiver;                  use #[func(abstract)] or an associated (static) function instead",
-            );
-        });
-    }
 
     if abstract_funcs.is_empty() {
         return code;

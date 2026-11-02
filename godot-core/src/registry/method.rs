@@ -165,17 +165,14 @@ impl ClassMethodInfo {
     /// Abstract methods have no Rust implementation in the declaring class, so there is nothing to dispatch to. They are registered with
     /// Godot through `classdb_register_extension_class_virtual_method()`, which only stores the signature -- used by the editor and by
     /// scripts to validate overrides. Subclasses register their own, callable method under the same name.
-    pub fn from_abstract_signature<
-        C: GodotClass,
-        Params: InParamTuple + 'static,
-        Ret: EngineToGodot + 'static,
-    >(
+    pub fn from_abstract_signature<Params: InParamTuple + 'static, Ret: EngineToGodot + 'static>(
+        class_id: ClassId,
         method_name: StringName,
         method_flags: MethodFlags,
         param_names: &[&str],
     ) -> Self {
         Self {
-            class_id: C::class_id(),
+            class_id,
             method_name,
             call_func: None,
             ptrcall_func: None,
