@@ -11,9 +11,9 @@ use quote::{ToTokens, format_ident, quote};
 
 use crate::class::data_models::func;
 use crate::class::{
-    ConstDefinition, FuncDefinition, RpcAttr, RpcMode, SignalDefinition, SignatureInfo,
-    TransferMode, into_signature_info, make_constant_registration, make_method_registration,
-    make_signal_registrations,
+    ConstDefinition, FuncDefinition, ReceiverType, RpcAttr, RpcMode, SignalDefinition,
+    SignatureInfo, TransferMode, into_signature_info, make_constant_registration,
+    make_method_registration, make_signal_registrations,
 };
 use crate::util::{
     KvParser, bail, c_str, format_funcs_collection_struct, ident, make_funcs_collection_constants,
@@ -58,7 +58,17 @@ impl AttrParseResult {
 struct FuncAttr {
     pub rename: Option<String>,
     pub is_virtual: bool,
+    pub is_abstract: bool,
     pub has_gd_self: bool,
+}
+
+/// An `#[func(abstract)]` declaration, which becomes a method of the generated `<Class>Abstract` trait.
+struct AbstractFuncDefinition {
+    /// Signature without body and without visibility marker (trait methods inherit the trait's visibility).
+    fn_signature: venial::Function,
+
+    /// The function's non-gdext attributes.
+    external_attributes: Vec<venial::Attribute>,
 }
 
 #[derive(Default)]
@@ -92,8 +102,11 @@ pub fn transform_inherent_impl(
     let prv = quote! { ::godot::private };
 
     // Can add extra functions to the end of the impl block.
-    let (funcs, signals) = process_godot_fns(&class_name, &mut impl_block, meta.secondary)?;
+    let (funcs, signals, abstract_funcs) =
+        process_godot_fns(&class_name, &mut impl_block, meta.secondary)?;
     let consts = process_godot_constants(&mut impl_block)?;
+
+    let abstract_items = make_abstract_items(&class_name, &funcs, &abstract_funcs);
 
     let inherent_impl_docs =
         crate::docs::make_trait_docs_registration(&funcs, &consts, &signals, &class_name, &prv);
@@ -138,6 +151,13 @@ pub fn transform_inherent_impl(
 
     let (rpc_registrations, rpc_api) =
         crate::class::make_rpc_registrations(&class_name, &funcs, meta.no_typed_rpcs);
+
+    // Names of `#[func(abstract)]` methods, so that registration can verify concrete subclasses implement them.
+    let abstract_method_names = funcs
+        .iter()
+        .filter(|func| func.is_abstract)
+        .map(|func| func.godot_name())
+        .collect::<Vec<_>>();
 
     let method_registrations: Vec<TokenStream> = funcs
         .into_iter()
@@ -204,7 +224,10 @@ pub fn transform_inherent_impl(
 
         let class_registration = quote! {
             ::godot::sys::shard_add!(#prv::__GODOT_SHARD_REGISTRY; #prv::ClassShard::new::<#class_name>(
-                #prv::ShardItem::InherentImpl(#prv::InherentImpl::new::<#class_name>())
+                #prv::ShardItem::InherentImpl(
+                    #prv::InherentImpl::new::<#class_name>()
+                        .with_abstract_methods(&[ #( #abstract_method_names ),* ])
+                )
             ));
         };
 
@@ -218,6 +241,7 @@ pub fn transform_inherent_impl(
             #signal_symbol_types
             #rpc_api
             #inherent_impl_docs
+            #abstract_items
         };
 
         Ok(result)
@@ -230,6 +254,7 @@ pub fn transform_inherent_impl(
             #funcs_collection_impl
             #fill_storage
             #inherent_impl_docs
+            #abstract_items
         };
 
         Ok(result)
@@ -257,9 +282,14 @@ fn process_godot_fns(
     class_name: &Ident,
     impl_block: &mut venial::Impl,
     is_secondary_impl: bool,
-) -> ParseResult<(Vec<FuncDefinition>, Vec<SignalDefinition>)> {
+) -> ParseResult<(
+    Vec<FuncDefinition>,
+    Vec<SignalDefinition>,
+    Vec<AbstractFuncDefinition>,
+)> {
     let mut func_definitions = vec![];
     let mut signal_definitions = vec![];
+    let mut abstract_definitions = vec![];
     let mut virtual_functions = vec![];
 
     let mut removed_indexes = vec![];
@@ -303,6 +333,33 @@ fn process_godot_fns(
                         &function,
                         "#[rpc] is currently not supported in secondary impl blocks",
                     )?;
+                }
+
+                if func.is_abstract {
+                    if is_secondary_impl {
+                        return bail!(
+                            &function,
+                            "#[func(abstract)] is currently not supported in secondary impl blocks",
+                        );
+                    }
+                    if rpc_info.is_some() {
+                        return bail!(
+                            &function,
+                            "#[func(abstract)] cannot be combined with #[rpc]"
+                        );
+                    }
+                    if function.body.is_some() {
+                        return bail!(
+                            &function.body,
+                            "#[func(abstract)] must not have a body; declare the function with a semicolon",
+                        );
+                    }
+                    if function.params.is_empty() {
+                        return bail!(
+                            &function,
+                            "#[func(abstract)] requires a `&self` or `&mut self` receiver",
+                        );
+                    }
                 }
 
                 let external_attributes = function.attributes.clone();
@@ -353,11 +410,40 @@ fn process_godot_fns(
                     func.rename
                 };
 
+                if func.is_abstract {
+                    if !signature_info.optional_param_default_exprs.is_empty() {
+                        return bail!(
+                            &function,
+                            "#[func(abstract)] does not support `#[opt(default = ...)]` parameters",
+                        );
+                    }
+
+                    // The declaring class provides no implementation, so the function is dropped from the `impl` block and instead lands in
+                    // the generated `<Class>Abstract` trait, which subclasses must implement.
+                    let mut fn_signature = signature.clone();
+                    fn_signature.vis_marker = None;
+                    fn_signature.body = None;
+                    fn_signature.tk_semicolon = None;
+                    for param in fn_signature.params.inner.iter_mut() {
+                        if let venial::FnParam::Typed(typed) = &mut param.0 {
+                            typed.attributes.clear();
+                        }
+                    }
+
+                    abstract_definitions.push(AbstractFuncDefinition {
+                        fn_signature,
+                        external_attributes: external_attributes.clone(),
+                    });
+
+                    removed_indexes.push(index);
+                }
+
                 func_definitions.push(FuncDefinition {
                     signature_info,
                     external_attributes,
                     registered_name,
                     is_script_virtual: func.is_virtual,
+                    is_abstract: func.is_abstract,
                     rpc_info,
                     is_generated_accessor: false,
                 });
@@ -419,7 +505,79 @@ fn process_godot_fns(
         impl_block.body_items.push(member);
     }
 
-    Ok((func_definitions, signal_definitions))
+    Ok((func_definitions, signal_definitions, abstract_definitions))
+}
+
+/// Generates the `<Class>Abstract` trait for `#[func(abstract)]` declarations, plus compile-time checks tying `#[func(abstract)]` and
+/// `#[class(abstract)]` together.
+fn make_abstract_items(
+    class_name: &Ident,
+    funcs: &[FuncDefinition],
+    abstract_funcs: &[AbstractFuncDefinition],
+) -> TokenStream {
+    let mut code = TokenStream::new();
+
+    // Concrete instance methods are registered for *this* class's struct; a subclass object holds a different struct, so such methods must
+    // never be inherited through `#[class(base = ThisClass)]`. Statics are fine, as they ignore the instance.
+    let has_concrete_instance_func = funcs
+        .iter()
+        .any(|func| !func.is_abstract && func.signature_info.receiver_type != ReceiverType::Static);
+
+    if has_concrete_instance_func {
+        code.extend(quote! {
+            const _: () = assert!(
+                !<#class_name as ::godot::obj::GodotClass>::__IS_ABSTRACT,
+                "#[class(abstract)] classes must not declare #[func]s with a `self` receiver;                  use #[func(abstract)] or an associated (static) function instead",
+            );
+        });
+    }
+
+    if abstract_funcs.is_empty() {
+        return code;
+    }
+
+    code.extend(quote! {
+        const _: () = assert!(
+            <#class_name as ::godot::obj::GodotClass>::__IS_ABSTRACT,
+            "#[func(abstract)] requires the class to be declared #[class(abstract)]",
+        );
+    });
+
+    let trait_name = format_ident!("{class_name}Abstract");
+    let visibility_macro = util::format_class_visibility_macro(class_name);
+
+    let trait_methods = abstract_funcs.iter().map(|def| {
+        let cfg_attrs = util::extract_cfg_attrs(&def.external_attributes)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let docs = util::extract_doc_attrs(&def.external_attributes)
+            .into_iter()
+            .collect::<Vec<_>>();
+        let signature = &def.fn_signature;
+
+        quote! {
+            #( #docs )*
+            #( #cfg_attrs )*
+            #signature;
+        }
+    });
+
+    let trait_doc = format!(
+        "Abstract methods of [`{class_name}`], which every subclass must implement.
+
+        Declared by the `#[func(abstract)]` functions of `{class_name}`. Implement it with         `#[godot_api] impl {trait_name} for MySubclass`, so that the methods are registered with Godot for the subclass."
+    );
+
+    code.extend(quote! {
+        #visibility_macro! {
+            #[doc = #trait_doc]
+            trait #trait_name: ::godot::obj::GodotClass {
+                #( #trait_methods )*
+            }
+        }
+    });
+
+    code
 }
 
 fn process_godot_constants(decl: &mut venial::Impl) -> ParseResult<Vec<ConstDefinition>> {
@@ -683,14 +841,43 @@ fn parse_func_attr(attributes: &[venial::Attribute]) -> ParseResult<AttrParseRes
         false
     };
 
+    // #[func(abstract)]
+    let is_abstract = if let Some(span) = parser.handle_alone_with_span("abstract")? {
+        if is_virtual {
+            return bail!(
+                span,
+                "#[func(abstract)] and #[func(virtual)] are mutually exclusive",
+            );
+        }
+        true
+    } else {
+        false
+    };
+
     // #[func(gd_self)]
     let has_gd_self = parser.handle_alone("gd_self")?;
+
+    if is_abstract && has_gd_self {
+        return bail!(
+            parser.span(),
+            "#[func(abstract)] cannot be combined with `gd_self`",
+        );
+    }
+
+    if is_abstract && rename.is_some() {
+        // Subclasses register the method under its Rust name, which must match what the base class declared.
+        return bail!(
+            parser.span(),
+            "#[func(abstract)] cannot be combined with `rename`",
+        );
+    }
 
     parser.finish()?;
 
     Ok(AttrParseResult::Func(FuncAttr {
         rename,
         is_virtual,
+        is_abstract,
         has_gd_self,
     }))
 }

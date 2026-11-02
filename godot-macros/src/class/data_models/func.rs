@@ -28,6 +28,9 @@ pub struct FuncDefinition {
     /// True for script-virtual functions.
     pub is_script_virtual: bool,
 
+    /// True for `#[func(abstract)]`: declared without body, registered as metadata only, implemented by subclasses.
+    pub is_abstract: bool,
+
     /// Information about the RPC configuration, if provided.
     pub rpc_info: Option<RpcAttr>,
 
@@ -69,7 +72,7 @@ pub fn make_virtual_callback(
 
     let wrapped_method = make_forwarding_closure(
         class_name,
-        trait_base_class,
+        Some(trait_base_class),
         signature_info,
         before_kind,
         interface_trait,
@@ -119,14 +122,28 @@ pub fn make_method_registration(
     let sig_ret = &signature_info.return_type;
 
     let is_script_virtual = func_definition.is_script_virtual;
-    let method_flags = match make_method_flags(signature_info.receiver_type, is_script_virtual) {
+    let method_flags = match make_method_flags(
+        signature_info.receiver_type,
+        is_script_virtual,
+        func_definition.is_abstract,
+    ) {
         Ok(mf) => mf,
         Err(msg) => return bail_fn(msg, &signature_info.method_name),
     };
 
+    if func_definition.is_abstract {
+        return Ok(make_abstract_method_registration(
+            &class_name,
+            &func_definition,
+            method_flags,
+        ));
+    }
+
     let forwarding_closure = make_forwarding_closure(
         &class_name,
-        &class_name, // Not used in this case.
+        // Regular methods aren't engine virtuals, so there is no `virtuals::<Base>` signature to annotate with -- this also covers
+        // `#[godot_api] impl <Class>Abstract for Sub`, whose trait is user-declared.
+        None,
         signature_info,
         BeforeKind::Without,
         interface_trait,
@@ -338,7 +355,8 @@ pub enum BeforeKind {
 /// Returns a closure expression that forwards the parameters to the Rust instance.
 fn make_forwarding_closure(
     class_name: &Ident,
-    trait_base_class: &Ident,
+    // `Some` only for engine interface traits (`impl I<Base> for Class`), whose signatures are looked up in `godot::private::virtuals`.
+    trait_base_class: Option<&Ident>,
     signature_info: &SignatureInfo,
     before_kind: BeforeKind,
     interface_trait: Option<&venial::TypeExpr>,
@@ -391,7 +409,9 @@ fn make_forwarding_closure(
                     _ => unreachable!("unexpected receiver type"), // checked above.
                 };
 
-                sig_tuple_annotation = make_sig_tuple_annotation(trait_base_class, method_name);
+                sig_tuple_annotation = trait_base_class
+                    .map(|base| make_sig_tuple_annotation(base, method_name))
+                    .unwrap_or_default();
 
                 // Use fresh spans for generated code (class_name, interface_trait), but keep method_name's original span for proper
                 // IDE navigation to user's function.
@@ -427,10 +447,9 @@ fn make_forwarding_closure(
             // Method call is always present, since GdSelf implies that the user declares the method.
             // (Absent method is only used in the case of a generated default virtual method, e.g. for ready()).
 
-            let sig_tuple_annotation = if interface_trait.is_some() {
-                make_sig_tuple_annotation(trait_base_class, method_name)
-            } else {
-                TokenStream::new()
+            let sig_tuple_annotation = match (interface_trait, trait_base_class) {
+                (Some(_), Some(base)) => make_sig_tuple_annotation(base, method_name),
+                _ => TokenStream::new(),
             };
 
             quote! {
@@ -607,6 +626,7 @@ pub(crate) fn maybe_rename_parameter(param_ident: Ident, next_unnamed_index: &mu
 fn make_method_flags(
     method_type: ReceiverType,
     is_script_virtual: bool,
+    is_abstract: bool,
 ) -> Result<TokenStream, String> {
     let flags = quote! { ::godot::register::info::MethodFlags };
 
@@ -624,17 +644,87 @@ fn make_method_flags(
                     "#[func(virtual)] is not allowed for associated (static) functions".to_string(),
                 );
             }
+            if is_abstract {
+                return Err(
+                    "#[func(abstract)] is not allowed for associated (static) functions"
+                        .to_string(),
+                );
+            }
             quote! { #flags::NORMAL | #flags::STATIC }
         }
     };
 
-    let flags = if is_script_virtual {
+    let flags = if is_abstract {
+        // Abstract methods are virtual methods that *must* be overridden. Godot 4.5 exposes that distinction in the method metadata.
+        if cfg!(since_api = "4.5") {
+            quote! { #base_flags | #flags::VIRTUAL | #flags::VIRTUAL_REQUIRED }
+        } else {
+            quote! { #base_flags | #flags::VIRTUAL }
+        }
+    } else if is_script_virtual {
         quote! { #base_flags | #flags::VIRTUAL }
     } else {
         base_flags
     };
 
     Ok(flags)
+}
+
+/// Registers an `#[func(abstract)]` method: signature metadata only, since the declaring class has no implementation to dispatch to.
+fn make_abstract_method_registration(
+    class_name: &Ident,
+    func_definition: &FuncDefinition,
+    method_flags: TokenStream,
+) -> TokenStream {
+    let signature_info = &func_definition.signature_info;
+    let sig_params = signature_info.params_type();
+    let sig_ret = &signature_info.return_type;
+
+    let class_name_str = class_name.to_string();
+    let method_name_str = func_definition.godot_name();
+
+    let param_ident_strs = signature_info
+        .param_idents
+        .iter()
+        .map(|ident| ident.to_string());
+
+    let cfg_attrs = util::extract_cfg_attrs(&func_definition.external_attributes)
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    let sig_ret_span = signature_info.params_span;
+    let type_and_bounds_check = quote_spanned! { sig_ret_span=>
+        ::godot::private::ensure_func_bounds::<CallParams, CallRet>();
+    };
+
+    quote! {
+        #(#cfg_attrs)*
+        {
+            use ::godot::register::private::method::ClassMethodInfo;
+            use ::godot::builtin::StringName;
+
+            type CallParams = #sig_params;
+            type CallRet = #sig_ret;
+
+            #type_and_bounds_check
+
+            let method_info = ClassMethodInfo::from_abstract_signature::<#class_name, CallParams, CallRet>(
+                StringName::from(#method_name_str),
+                #method_flags,
+                &[
+                    #( #param_ident_strs ),*
+                ],
+            );
+
+            ::godot::private::out!(
+                "   Register abstract fn: {}::{}",
+                #class_name_str,
+                #method_name_str
+            );
+
+            method_info.register_extension_class_method();
+        };
+    }
 }
 
 /// Generate code for a `ptrcall` call expression.

@@ -76,8 +76,8 @@ mod strict {
             );
         }
 
-        // Godot rejects a class whose base does not exist. Rust classes can only derive engine classes, so this is never an ordering problem
-        // between user classes; it fires when the base is not yet available at this init level.
+        // Godot rejects a class whose base does not exist. Classes deriving another *user* class are registered after their base (see
+        // sort_parents_first()), so this normally fires when the base is not yet available at this init level.
         let parent_class_name = parent_class_id.to_string_name();
         if !class_db.class_exists(&parent_class_name) {
             defer_startup_fatal!(
@@ -89,8 +89,9 @@ mod strict {
 
     /// Checks the preconditions of `classdb_register_extension_class_method`.
     ///
-    /// Not applicable to `classdb_register_extension_class_virtual_method`: Godot stores virtual methods in a separate map, which `ClassDB` does
-    /// not expose. Callers must skip this check for virtual methods, or it would query the wrong map.
+    /// Not applicable to `classdb_register_extension_class_virtual_method`: Godot stores virtual methods in a separate map, which
+    /// `class_has_method()` does not consult (only `class_get_method_list()` describes them). Callers must skip this check for virtual
+    /// methods, or it would query the wrong map.
     pub(crate) fn validate_method(class_id: ClassId, method_name: &StringName) {
         return_if_unavailable!();
 
@@ -122,6 +123,44 @@ mod strict {
                  Both stay registered -- either your method or the base one is called, depending on the static type at the call site.\n\
                  Rename the Rust fn or use #[func(rename = ...)]. This will become a hard error in godot-rust v0.6."
             );
+        }
+    }
+
+    /// Verifies that every concrete subclass of an `#[class(abstract)]` class implements all of its `#[func(abstract)]` methods.
+    ///
+    /// Abstract methods are registered as *virtual* methods on the declaring class, which only supplies metadata -- there is no callable
+    /// method bind. A concrete subclass must register its own method of the same name, which `#[godot_api] impl <Class>Abstract for Sub`
+    /// does. Rust alone cannot enforce this (the subclass's macros don't see the base class's `impl` block), hence the check here.
+    ///
+    /// Runs after all classes of the current init level are registered, so that `ClassDB` knows the full hierarchy.
+    pub(crate) fn validate_abstract_methods(
+        class_id: ClassId,
+        abstract_method_names: &'static [&'static str],
+    ) {
+        return_if_unavailable!();
+
+        let class_db = ClassDb::singleton();
+        let class_name = class_id.to_string_name();
+
+        for subclass in class_db.get_inheriters_from_class(&class_name).as_slice() {
+            let subclass_name = StringName::from(subclass);
+
+            // Abstract and non-constructible classes don't need implementations: no instance of them can exist.
+            if !class_db.can_instantiate(&subclass_name) {
+                continue;
+            }
+
+            for method_name in abstract_method_names {
+                let method_name = StringName::from(*method_name);
+                if class_db.class_has_method(&subclass_name, &method_name) {
+                    continue;
+                }
+
+                defer_startup_fatal!(
+                    "Class `{subclass_name}` does not implement the abstract method `{class_id}::{method_name}`.\n\
+                     Add it via `#[godot_api] impl {class_id}Abstract for {subclass_name}`."
+                );
+            }
         }
     }
 
@@ -260,6 +299,12 @@ mod noop {
 
     pub(crate) fn validate_class(_class_id: ClassId, _parent_class_id: ClassId) {}
     pub(crate) fn validate_method(_class_id: ClassId, _method_name: &StringName) {}
+
+    pub(crate) fn validate_abstract_methods(
+        _class_id: ClassId,
+        _abstract_method_names: &'static [&'static str],
+    ) {
+    }
     pub(crate) fn validate_constant(_class_id: ClassId, _constant_name: &StringName) {}
 
     pub(crate) fn validate_property(

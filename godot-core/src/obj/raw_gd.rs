@@ -476,6 +476,22 @@ where
     }
 }
 
+/// Panics if `T` is an abstract class (`#[class(abstract)]`), which can never have a Rust instance of its own.
+///
+/// A `Gd<Abstract>` always points at an object of some concrete subclass, whose instance storage holds *that* class's struct. Handing out
+/// `&Abstract` would reinterpret unrelated memory, so borrowing is rejected -- call Godot methods on the object instead, or downcast with
+/// [`Gd::try_cast()`][crate::obj::Gd::try_cast].
+fn deny_abstract_bind<T: GodotClass>(method_name: &'static str) {
+    if T::__IS_ABSTRACT {
+        panic!(
+            "{}(): cannot borrow the Rust instance of abstract class `{}`.\n\
+            Abstract classes have no instances of their own; cast to the concrete subclass first (e.g. `Gd::try_cast()`).",
+            method_name,
+            sys::short_type_name::<T>(),
+        );
+    }
+}
+
 impl<T> RawGd<T>
 where
     T: GodotClass + Bounds<Declarer = bounds::DeclUser>,
@@ -485,6 +501,7 @@ where
     /// See [`Gd::bind()`] for a more in depth explanation.
     // Note: possible names: write/read, hold/hold_mut, r/w, r/rw, ...
     pub(crate) fn bind(&self) -> GdRef<'_, T> {
+        deny_abstract_bind::<T>("bind");
         self.check_rtti("bind");
         let storage = self
             .storage()
@@ -496,6 +513,7 @@ where
     ///
     /// See [`Gd::bind_mut()`] for a more in depth explanation.
     pub(crate) fn bind_mut(&mut self) -> GdMut<'_, T> {
+        deny_abstract_bind::<T>("bind_mut");
         self.check_rtti("bind_mut");
         let storage = self
             .storage()

@@ -20,6 +20,20 @@ mod list_parser;
 pub(crate) use kv_parser::KvParser;
 pub(crate) use list_parser::ListParser;
 
+mod engine_classes {
+    include!(concat!(env!("OUT_DIR"), "/engine_classes.rs"));
+}
+
+/// Returns true if `name` is the name of a Godot engine class (i.e. declared in `godot::classes`).
+///
+/// Used by `#[class(base = X)]` to tell engine base classes apart from user-declared ones. The list is generated from `extension_api.json`
+/// at build time and includes *all* engine classes, also those excluded by `codegen-lean` -- a user class must not shadow any of them.
+pub fn is_engine_class(name: &str) -> bool {
+    engine_classes::ENGINE_CLASS_NAMES
+        .binary_search(&name)
+        .is_ok()
+}
+
 /// Creates an identifier with a fresh `Span::call_site()` span.
 ///
 /// Use this to generate internal/synthetic identifiers that should *not* be attributed to user code. This prevents IDE features

@@ -119,6 +119,8 @@ pub(crate) type GodotGetVirtual = <sys::GDExtensionClassGetVirtual2 as sys::Inne
 struct ClassRegistrationInfo {
     class_id: ClassId,
     parent_class_id: Option<ClassId>,
+    /// `#[func(abstract)]` methods declared by this class; subclasses must implement them.
+    abstract_method_names: &'static [&'static str],
     // Following functions are stored separately, since their order matters.
     register_methods_constants_fn: Option<ErasedRegisterFn>,
     register_properties_fn: Option<ErasedRegisterFn>,
@@ -204,6 +206,7 @@ pub(crate) fn register_class<
     register_class_raw(ClassRegistrationInfo {
         class_id: T::class_id(),
         parent_class_id: Some(T::Base::class_id()),
+        abstract_method_names: &[],
         register_methods_constants_fn: None,
         register_properties_fn: None,
         user_register_fn: Some(ErasedRegisterFn {
@@ -248,11 +251,16 @@ pub fn auto_register_classes(init_level: InitLevel) {
         fill_class_info(elem.item.clone(), class_info);
     });
 
+    // Godot requires a class's parent to be registered first, which matters for classes deriving from another *user* class
+    // (`#[class(base = SomeRustClass)]`). The shard map has no inherent order, so establish one here; it's also used for bookkeeping below,
+    // so that unregistration (which walks the list in reverse) frees subclasses before their bases.
+    let mut classes = sort_parents_first(map);
+
     // First register all the loaded classes and dyn traits.
     // We need all the dyn classes in the registry to properly register DynGd properties;
     // one can do it directly inside the loop – by locking and unlocking the mutex –
     // but it is much slower and doesn't guarantee that all the dependent classes will be already loaded in most cases.
-    register_classes_and_dyn_traits(&mut map, init_level);
+    register_classes_and_dyn_traits(&mut classes, init_level);
 
     // Before Godot 4.4.1, editor plugins were added to the editor immediately, triggering their lifecycle methods –- even before their
     // dependencies (e.g. properties) have been registered.
@@ -266,8 +274,15 @@ pub fn auto_register_classes(init_level: InitLevel) {
     // Similarly to EnginePlugins – freshly instantiated engine singleton might depend on some not-yet-registered classes.
     let mut singletons: Vec<fn()> = Vec::new();
 
+    // Abstract methods of these classes must be implemented by every concrete subclass; checked once all classes are registered.
+    let abstract_decls: Vec<(ClassId, &'static [&'static str])> = classes
+        .iter()
+        .filter(|info| !info.abstract_method_names.is_empty())
+        .map(|info| (info.class_id, info.abstract_method_names))
+        .collect();
+
     // Actually register all the classes.
-    for info in map.into_values() {
+    for info in classes {
         #[cfg(feature = "debug-log")]
         let class_id = info.class_id;
 
@@ -292,18 +307,51 @@ pub fn auto_register_classes(init_level: InitLevel) {
         unsafe { interface_fn!(editor_add_plugin)(editor_plugin_class_id.string_sys()) };
     }
 
+    for (class_id, method_names) in abstract_decls {
+        reg_validation::validate_abstract_methods(class_id, method_names);
+    }
+
     out!("All classes for level `{init_level:?}` auto-registered.");
 }
 
-fn register_classes_and_dyn_traits(
-    map: &mut HashMap<ClassId, ClassRegistrationInfo>,
-    init_level: InitLevel,
-) {
+/// Orders classes so that a class's parent precedes it, if that parent is registered in the same batch.
+///
+/// Only relevant for user classes deriving from other user classes; engine base classes are always registered already.
+fn sort_parents_first(map: HashMap<ClassId, ClassRegistrationInfo>) -> Vec<ClassRegistrationInfo> {
+    fn visit(
+        class_id: ClassId,
+        remaining: &mut HashMap<ClassId, ClassRegistrationInfo>,
+        result: &mut Vec<ClassRegistrationInfo>,
+    ) {
+        // Removing before recursing also guards against (impossible, but cheap to rule out) cycles.
+        let Some(info) = remaining.remove(&class_id) else {
+            return; // Already emitted, or an engine class that isn't part of this batch.
+        };
+
+        if let Some(parent_class_id) = info.parent_class_id {
+            visit(parent_class_id, remaining, result);
+        }
+
+        result.push(info);
+    }
+
+    let mut remaining = map;
+    let mut result = Vec::with_capacity(remaining.len());
+
+    let class_ids: Vec<ClassId> = remaining.keys().copied().collect();
+    for class_id in class_ids {
+        visit(class_id, &mut remaining, &mut result);
+    }
+
+    result
+}
+
+fn register_classes_and_dyn_traits(classes: &mut [ClassRegistrationInfo], init_level: InitLevel) {
     let mut loaded_classes_by_level = global_loaded_classes_by_init_level();
     let mut loaded_classes_by_id = global_loaded_classes_by_id();
     let mut dyn_traits_by_typeid = global_dyn_traits_by_typeid();
 
-    for info in map.values_mut() {
+    for info in classes.iter_mut() {
         let class_id = info.class_id;
         out!("Register class:   {class_id} at level `{init_level:?}`");
 
@@ -481,6 +529,7 @@ fn fill_class_info(item: ShardItem, c: &mut ClassRegistrationInfo) {
             is_editor_plugin,
             is_internal,
             is_instantiable,
+            is_abstract,
             reference_fn,
             unreference_fn,
         }) => {
@@ -501,6 +550,10 @@ fn fill_class_info(item: ShardItem, c: &mut ClassRegistrationInfo) {
             //
             // See also: https://github.com/godotengine/godot/pull/58972
             c.godot_params.is_abstract = sys::conv::bool_to_sys(!is_instantiable);
+
+            // `#[class(abstract)]` maps to Godot's "virtual" flag, which is what Godot calls an abstract base class
+            // (see GDREGISTER_VIRTUAL_CLASS). `ClassDb::can_instantiate()` returns false for those.
+            c.godot_params.is_virtual = sys::conv::bool_to_sys(is_abstract);
             c.godot_params.free_instance_func = Some(free_fn);
             c.godot_params.reference_func = reference_fn;
             c.godot_params.unreference_func = unreference_fn;
@@ -531,8 +584,10 @@ fn fill_class_info(item: ShardItem, c: &mut ClassRegistrationInfo) {
         ShardItem::InherentImpl(InherentImpl {
             register_methods_constants_fn,
             register_rpcs_fn: _,
+            abstract_method_names,
         }) => {
             c.register_methods_constants_fn = Some(register_methods_constants_fn);
+            c.abstract_method_names = abstract_method_names;
         }
 
         ShardItem::ITraitImpl(ITraitImpl {
@@ -745,6 +800,7 @@ fn default_registration_info(class_id: ClassId) -> ClassRegistrationInfo {
     ClassRegistrationInfo {
         class_id,
         parent_class_id: None,
+        abstract_method_names: &[],
         register_methods_constants_fn: None,
         register_properties_fn: None,
         user_register_fn: None,

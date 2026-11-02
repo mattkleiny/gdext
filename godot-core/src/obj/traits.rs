@@ -45,6 +45,14 @@ where
     /// It must not be less than `Base::INIT_LEVEL`.
     const INIT_LEVEL: InitLevel = <Self::Base as GodotClass>::INIT_LEVEL;
 
+    /// `true` for user classes declared with `#[class(abstract)]`.
+    ///
+    /// Abstract classes have no instances of their own: every Godot object whose class derives from an abstract class is an instance of some
+    /// concrete subclass, and holds *that* subclass's Rust struct. Consequently, no `&Self` can ever be obtained for an abstract class, which
+    /// is why [`Gd::bind()`][crate::obj::Gd::bind] panics for them.
+    #[doc(hidden)]
+    const __IS_ABSTRACT: bool = false;
+
     /// Returns whether `Self` inherits from `Base`.
     ///
     /// This is reflexive, i.e `Self` inherits from itself.
@@ -59,6 +67,17 @@ where
             Self::Base::inherits::<Base>()
         }
     }
+}
+
+/// Links a user class to its Godot-side parent class, if that parent is itself declared in Rust.
+///
+/// Implemented by `#[derive(GodotClass)]` for classes declared with `#[class(base = SomeRustClass)]`. Used by the generated
+/// `inherit_from_*__ensure_class_exists!` macros, which must name base classes by *type* -- a proc-macro cannot know the module path under
+/// which a class is reachable from its subclasses.
+#[doc(hidden)]
+pub trait GodotParentOf: GodotClass {
+    /// The class registered as this class's parent in Godot. Differs from [`GodotClass::Base`], which is always an engine class.
+    type Parent: GodotClass;
 }
 
 /// Type representing the absence of a base class, at the root of the hierarchy.

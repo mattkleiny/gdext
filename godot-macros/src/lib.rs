@@ -123,6 +123,115 @@ use crate::util::{KvParser, bail, ident};
 /// }
 /// ```
 ///
+/// ## Abstract classes -- `#[class(abstract)]`
+/// `#[class(abstract)]` declares a class that cannot be instantiated. Godot registers it as an abstract base class, so
+/// `ClassDb::can_instantiate()` returns false and neither GDScript nor the editor offers a constructor for it.
+///
+/// Abstract classes exist to be inherited: they are the only Rust classes that can appear in `#[class(base = ...)]` of another Rust class.
+/// They hold no instance state of their own, which restricts what they may declare:
+///
+/// * no `#[var]` or `#[export]` fields,
+/// * no `#[func]` with a `self` receiver -- use [`#[func(abstract)]`](attr.godot_api.html#abstract-methods) instead,
+/// * `#[class(init)]` and a user-defined `init()` are rejected; `#[func]` associated (static) functions, `#[constant]` and `#[signal]`
+///   are fine.
+///
+/// The reason is that every Godot object whose class derives from an abstract class is an instance of some *concrete* subclass and holds
+/// that subclass's Rust struct -- there is no separate instance for the abstract class. Methods or property accessors registered for the
+/// abstract class would therefore be invoked with a `self` of the wrong type. For the same reason, `Gd::bind()` and `Gd::bind_mut()` panic
+/// on an abstract class; cast to the concrete subclass first (e.g. with [`Gd::try_cast()`][crate::obj::Gd::try_cast]).
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(abstract, base = Resource)]
+/// struct Shape {}
+///
+/// #[godot_api]
+/// impl Shape {
+///     /// Every subclass must implement this.
+///     #[func(abstract)]
+///     fn area(&self) -> f64;
+/// }
+/// ```
+///
+/// ## Inheriting a Rust class -- `#[class(base = MyAbstractClass)]`
+/// `#[class(base = ...)]` also accepts another Rust class, as long as it is declared `#[class(abstract)]`. This is inheritance at the
+/// *Godot* level: the subclass is registered with the abstract class as its parent, so GDScript sees `Subclass extends Shape`, `Gd<Shape>`
+/// can hold subclass objects, and casts in both directions work. It is *not* Rust inheritance -- the subclass struct does not contain the
+/// base struct, and `Deref` to the base class is not provided.
+///
+/// `GodotClass::Base` keeps pointing at the nearest *engine* class (`Resource` in the example below), so `Base<T>` fields and
+/// `impl I<EngineClass> for Subclass` keep working as usual.
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(abstract, base = Resource)]
+/// # struct Shape {}
+/// # #[godot_api]
+/// # impl Shape {
+/// #     #[func(abstract)]
+/// #     fn area(&self) -> f64;
+/// # }
+/// #[derive(GodotClass)]
+/// #[class(init, base = Shape)]
+/// struct Circle {
+///     #[var]
+///     radius: f64,
+///     base: Base<Resource>, // engine base, not `Shape`.
+/// }
+///
+/// #[godot_api]
+/// impl Circle {}
+///
+/// // Implementing the generated `ShapeAbstract` trait registers `area()` for `Circle`.
+/// #[godot_api]
+/// impl ShapeAbstract for Circle {
+///     fn area(&self) -> f64 {
+///         std::f64::consts::PI * self.radius * self.radius
+///     }
+/// }
+/// ```
+///
+/// Rejected at compile time -- an abstract class with a constructor:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(abstract, init, base = Resource)]
+/// struct Shape {}
+/// ```
+///
+/// ...an abstract class with a property:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(abstract, base = Resource)]
+/// struct Shape {
+///     #[var]
+///     area: f64,
+/// }
+/// ```
+///
+/// ...and a concrete Rust class used as base:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Resource)]
+/// struct Concrete {}
+///
+/// #[derive(GodotClass)]
+/// #[class(init, base = Concrete)]
+/// struct Derived {}
+/// ```
+///
+/// Limitations to be aware of:
+///
+/// * The base class must be declared `#[class(abstract)]`; concrete Rust classes cannot be inherited.
+/// * Engine virtual methods (`impl INode for Shape`) declared on the abstract class are *not* inherited by subclasses -- Godot asks the
+///   most-derived extension class for its virtual table. Override them in each subclass.
+/// * If the base class lives in another module whose name is not in scope, write it as a path (`base = crate::shapes::Shape`). Base classes
+///   in another crate additionally need that crate's `inherit_from_<Class>__ensure_class_exists!` macro imported.
+///
 ///
 /// # Properties and exports
 /// See also [book chapter _Registering properties_](https://godot-rust.github.io/book/register/properties.html#registering-properties).
@@ -1033,6 +1142,97 @@ pub fn derive_godot_class(input: TokenStream) -> TokenStream {
 /// - Only GDScript overrides may use `await`; other scripting languages are not supported.
 /// - The Rust default body (run when no script overrides the method) must be synchronous.
 /// - To await across `task::spawn` (not just inline), use `gd_self`, since `&self`/`&mut self` cannot be held across `.await`.
+///
+/// ## Abstract methods
+///
+/// Inside an `#[class(abstract)]` class, `#[func(abstract)]` declares a method without a body -- written with a semicolon, like a trait
+/// method. The abstract class registers only the signature with Godot, flagged as a required virtual method (`METHOD_FLAG_VIRTUAL` and,
+/// since Godot 4.5, `METHOD_FLAG_VIRTUAL_REQUIRED`), so the editor and scripts know that overriding it is mandatory.
+///
+/// For each class with at least one abstract method, the macro generates a trait `<Class>Abstract` containing those methods. Subclasses
+/// implement it through `#[godot_api] impl <Class>Abstract for Subclass`, which both satisfies the Rust-level requirement and registers
+/// the methods with Godot for that subclass. Forgetting the implementation is a compile error, not a runtime surprise.
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(abstract, base = Resource)]
+/// struct Shape {}
+///
+/// #[godot_api]
+/// impl Shape {
+///     /// Area of the shape, in square units.
+///     #[func(abstract)]
+///     fn area(&self) -> f64;
+///
+///     #[func(abstract)]
+///     fn scale_by(&mut self, factor: f64);
+/// }
+///
+/// #[derive(GodotClass)]
+/// #[class(init, base = Shape)]
+/// struct Square {
+///     #[var]
+///     side: f64,
+///     base: Base<Resource>,
+/// }
+///
+/// #[godot_api]
+/// impl Square {}
+///
+/// #[godot_api]
+/// impl ShapeAbstract for Square {
+///     fn area(&self) -> f64 {
+///         self.side * self.side
+///     }
+///
+///     fn scale_by(&mut self, factor: f64) {
+///         self.side *= factor;
+///     }
+/// }
+/// ```
+///
+/// Rejected at compile time -- an abstract method with a body:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(abstract, base = Resource)]
+/// # struct Shape {}
+/// #[godot_api]
+/// impl Shape {
+///     #[func(abstract)]
+///     fn area(&self) -> f64 {
+///         0.0
+///     }
+/// }
+/// ```
+///
+/// ...and an abstract method in a non-abstract class:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(init, base = Resource)]
+/// struct Shape {}
+///
+/// #[godot_api]
+/// impl Shape {
+///     #[func(abstract)]
+///     fn area(&self) -> f64;
+/// }
+/// ```
+///
+/// `#[func(abstract)]` requires a `self` receiver and cannot be combined with `virtual`, `gd_self`, `rename`, `#[rpc]` or
+/// `#[opt(default = ...)]`. The subclass must declare its `#[godot_api] impl <Class>Abstract` block *and* a primary `#[godot_api] impl`
+/// block, which holds the registration storage both share.
+///
+/// Note the difference to [`#[func(virtual)]`](#virtual-methods): that one has a Rust default implementation which a *GDScript* subclass may
+/// override, whereas `#[func(abstract)]` has no implementation at all and is implemented by *Rust* subclasses.
+///
+/// Registering the signature with Godot needs API level 4.3+; on Godot 4.2 the Rust-side trait and the subclass methods still work, but the
+/// abstract declaration is not visible in `ClassDB`.
+///
+/// Whether all concrete subclasses actually implement the methods is additionally verified at startup (debug builds, Godot 4.5+), which also
+/// catches subclasses declared in GDScript or another extension.
 ///
 /// ## RPC attributes
 /// You can use the `#[rpc]` attribute to let your functions act as remote procedure calls (RPCs) in Godot. This is the Rust equivalent of

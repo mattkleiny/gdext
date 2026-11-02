@@ -9,7 +9,10 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
 use crate::ParseResult;
-use crate::class::{transform_inherent_impl, transform_trait_impl};
+use crate::class::{
+    is_abstract_trait_impl, transform_abstract_trait_impl, transform_inherent_impl,
+    transform_trait_impl,
+};
 use crate::util::{KvParser, bail, venial_parse_meta};
 
 fn parse_inherent_impl_attr(meta: TokenStream) -> Result<super::InherentImplAttr, venial::Error> {
@@ -72,7 +75,11 @@ pub fn attribute_godot_api(
                 "#[godot_api] on a trait implementation currently does not support any parameters"
             );
         }
-        transform_trait_impl(decl)
+        if is_abstract_trait_impl(&decl) {
+            transform_abstract_trait_impl(decl)
+        } else {
+            transform_trait_impl(decl)
+        }
     } else {
         match parse_inherent_impl_attr(meta) {
             Ok(meta) => transform_inherent_impl(meta, decl, self_path),

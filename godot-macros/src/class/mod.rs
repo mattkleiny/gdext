@@ -10,6 +10,7 @@ mod godot_api;
 mod godot_dyn;
 
 mod data_models {
+    pub mod abstract_trait_impl;
     pub mod constant;
     pub mod field;
     pub mod field_export;
@@ -25,6 +26,7 @@ mod data_models {
     pub mod signal;
 }
 
+pub(crate) use data_models::abstract_trait_impl::*;
 pub(crate) use data_models::constant::*;
 pub(crate) use data_models::field::*;
 pub(crate) use data_models::field_export::*;

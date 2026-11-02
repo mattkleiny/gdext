@@ -30,6 +30,8 @@ venial = { workspace = true }
 
 [build-dependencies]
 godot-bindings = { path = "../godot-bindings", version = "=0.5.5" } # emit_godot_version_cfg
+heck = { workspace = true } # Godot -> Rust class name conversion, mirroring godot-codegen
+nanoserde = { workspace = true } # extract engine class names from extension API JSON
 
 # Reverse dev dependencies so doctests can use `godot::` prefix.
 [dev-dependencies]

@@ -467,6 +467,7 @@ impl GetterSetterImpl {
                 // The Rust function name may differ from the Godot name (e.g. `__godot_get_field` vs `get_field`).
                 registered_name: Some(godot_function_name.to_string()),
                 is_script_virtual: false,
+                is_abstract: false,
                 rpc_info: None,
                 is_generated_accessor: true,
             },

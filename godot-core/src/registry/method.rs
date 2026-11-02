@@ -160,6 +160,33 @@ impl ClassMethodInfo {
         }
     }
 
+    /// Builds method info for an abstract method (`#[func(abstract)]`): metadata only, no callbacks.
+    ///
+    /// Abstract methods have no Rust implementation in the declaring class, so there is nothing to dispatch to. They are registered with
+    /// Godot through `classdb_register_extension_class_virtual_method()`, which only stores the signature -- used by the editor and by
+    /// scripts to validate overrides. Subclasses register their own, callable method under the same name.
+    pub fn from_abstract_signature<
+        C: GodotClass,
+        Params: InParamTuple + 'static,
+        Ret: EngineToGodot + 'static,
+    >(
+        method_name: StringName,
+        method_flags: MethodFlags,
+        param_names: &[&str],
+    ) -> Self {
+        Self {
+            class_id: C::class_id(),
+            method_name,
+            call_func: None,
+            ptrcall_func: None,
+            method_userdata: std::ptr::null_mut(),
+            method_flags,
+            return_value: MethodParamOrReturnInfo::for_return::<Ret>(),
+            arguments: sig_params::<Params>(param_names),
+            default_arguments: Vec::new(),
+        }
+    }
+
     pub fn register_extension_class_method(&self) {
         use crate::obj::EngineBitfield as _;
 

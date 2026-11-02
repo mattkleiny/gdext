@@ -204,6 +204,11 @@ pub struct Struct {
 
     /// Whether the class has a default constructor.
     pub(crate) is_instantiable: bool,
+
+    /// Whether `#[class(abstract)]` was used.
+    ///
+    /// Registered as "virtual" in Godot terms, meaning an abstract base class (`ClassDb::can_instantiate()` returns false).
+    pub(crate) is_abstract: bool,
 }
 
 impl Struct {
@@ -225,6 +230,7 @@ impl Struct {
             is_editor_plugin: false,
             is_internal: false,
             is_instantiable: false,
+            is_abstract: false,
             // While Godot doesn't do anything with these callbacks for non-RefCounted classes, we can avoid instantiating them in Rust.
             reference_fn: refcounted.then_some(callbacks::reference::<T>),
             unreference_fn: refcounted.then_some(callbacks::unreference::<T>),
@@ -299,6 +305,21 @@ impl Struct {
         self.is_instantiable = true;
         self
     }
+
+    /// `#[class(abstract)]` -- registers the class as an abstract base class in Godot.
+    pub fn with_abstract(mut self) -> Self {
+        self.is_abstract = true;
+        self
+    }
+
+    /// `#[class(base = SomeUserClass)]` -- overrides the Godot-side parent class.
+    ///
+    /// For classes deriving from a *user* class, `GodotClass::Base` is the nearest *engine* base (so that engine virtual methods keep
+    /// working), while the class registered as parent in Godot is the user base class.
+    pub fn with_godot_parent<B: GodotClass>(mut self) -> Self {
+        self.base_class_id = B::class_id();
+        self
+    }
 }
 
 /// Stores registration functions for methods, constants, and documentation from inherent `#[godot_api]` impl blocks.
@@ -317,6 +338,11 @@ pub struct InherentImpl {
     // This field is only used during codegen-full.
     #[cfg_attr(not(feature = "codegen-full"), expect(dead_code))]
     pub(crate) register_rpcs_fn: Option<ErasedRegisterRpcsFn>,
+
+    /// Godot names of all `#[func(abstract)]` methods declared in this `impl` block.
+    ///
+    /// Used to verify at registration time that concrete subclasses provide an implementation.
+    pub(crate) abstract_method_names: &'static [&'static str],
 }
 
 impl InherentImpl {
@@ -328,7 +354,14 @@ impl InherentImpl {
             register_rpcs_fn: Some(ErasedRegisterRpcsFn {
                 raw: callbacks::register_user_rpcs::<T>,
             }),
+            abstract_method_names: &[],
         }
+    }
+
+    /// Declares the Godot names of the `#[func(abstract)]` methods in this `impl` block.
+    pub fn with_abstract_methods(mut self, names: &'static [&'static str]) -> Self {
+        self.abstract_method_names = names;
+        self
     }
 }
 
