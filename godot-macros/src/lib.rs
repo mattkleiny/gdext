@@ -328,6 +328,40 @@ use crate::util::{KvParser, bail, ident};
 /// below). A `&mut self` abstract method is therefore callable from outside the class, but not from the base's own code -- attempting it is
 /// a compile error rather than a runtime panic.
 ///
+/// For the same reason, a forwarder cannot be used while the object is borrowed exclusively -- from a `&mut self` method, for instance. The
+/// *concrete* subclass has no such restriction and can re-enter through `base_mut()`:
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(abstract, base = Node)]
+/// # struct Shape { base: Base<Node> }
+/// # #[godot_api]
+/// # impl Shape {
+/// #     #[func(abstract)]
+/// #     fn area(&self) -> f64;
+/// # }
+/// # #[derive(GodotClass)]
+/// # #[class(init, base = Shape)]
+/// # struct Circle { shape: Shape }
+/// # #[godot_api]
+/// # impl Circle {}
+/// # #[godot_api]
+/// # impl IShape for Circle {
+/// #     fn area(&self) -> f64 { 1.0 }
+/// # }
+/// #[godot_api]
+/// impl INode for Circle {
+///     fn ready(&mut self) {
+///         // `self.shape.area()` would fail here: the forwarder needs a shared borrow. Going through the re-borrow guard works, because
+///         // `Circle` is concrete and owns the instance storage.
+///         let mut base = self.base_mut();
+///         let area = base.call("area", &[]).to::<f64>();
+///         godot_print!("{area}");
+///     }
+/// }
+/// ```
+///
 /// Limitations to be aware of:
 ///
 /// * The base class must be declared `#[class(abstract)]` and have a `#[godot_api] impl` block (possibly empty); concrete Rust classes

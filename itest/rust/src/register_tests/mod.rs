@@ -7,6 +7,7 @@
 
 mod abstract_class_test;
 mod abstract_hierarchy_test;
+mod abstract_reentrancy_test;
 mod constant_test;
 mod conversion_test;
 mod derive_godotconvert_test;
