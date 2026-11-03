@@ -43,8 +43,16 @@ impl<'c, C: WithUserSignals> SignalObject<'c> for UserSignalObject<'c, C> {
     fn with_object_mut(&mut self, f: impl FnOnce(&mut Object)) {
         match self {
             Self::Internal { self_mut } => {
-                let mut guard = <C as WithBaseField>::base_mut(*self_mut);
-                f(guard.upcast_object_mut())
+                // An abstract class cannot take the re-borrow guard: it needs this instance's storage, which holds a *subclass*'s struct.
+                // Go through the object handle instead; emitting does not touch the storage. A Rust handler taking `&mut self` on the same
+                // object then hits a borrow error, same as for `Gd::signals()`. Const-folded, so concrete classes are unaffected.
+                if <C as GodotClass>::__IS_ABSTRACT {
+                    let mut gd = <C as WithBaseField>::to_gd(*self_mut).__upcast_object();
+                    f(gd.upcast_object_mut())
+                } else {
+                    let mut guard = <C as WithBaseField>::base_mut(*self_mut);
+                    f(guard.upcast_object_mut())
+                }
             }
             Self::External { gd } => f(gd.upcast_object_mut()),
         }

@@ -100,6 +100,16 @@ pub fn transform_abstract_trait_impl(impl_block: venial::Impl) -> ParseResult<To
 
     // Reuse the registration storage set up by the class's primary `#[godot_api] impl` block -- same mechanism as secondary impl blocks.
     let class_name = ident(&class_name.to_string());
+
+    // An abstract class has no instances, so a method registered for it would be invoked with a *subclass* instance of a different Rust
+    // type. The methods also would not reach the subclass, since only a class's own `#[godot_api]` block contributes inheritable members.
+    let deny_abstract_self = quote! {
+        const _: () = assert!(
+            !<#class_name as ::godot::obj::GodotClass>::__IS_ABSTRACT,
+            "an abstract class cannot implement another abstract class's `I...` trait; \
+             declare a concrete #[func] of the same name instead, which subclasses inherit",
+        );
+    };
     let fill_storage = if method_registrations.is_empty() {
         TokenStream::new()
     } else {
@@ -117,6 +127,7 @@ pub fn transform_abstract_trait_impl(impl_block: venial::Impl) -> ParseResult<To
 
     Ok(quote! {
         #impl_block
+        #deny_abstract_self
         #fill_storage
     })
 }

@@ -260,7 +260,7 @@ use crate::util::{KvParser, bail, ident};
 /// }
 /// ```
 ///
-/// ...and a concrete Rust class used as base:
+/// ...a concrete Rust class used as base:
 /// ```compile_fail
 /// # use godot::prelude::*;
 /// #[derive(GodotClass)]
@@ -272,10 +272,72 @@ use crate::util::{KvParser, bail, ident};
 /// struct Derived {}
 /// ```
 ///
+/// ...and an abstract class implementing its base's `I<...>` trait:
+/// ```compile_fail
+/// # use godot::prelude::*;
+/// # #[derive(GodotClass)]
+/// # #[class(abstract, base = Resource)]
+/// # struct Shape { base: Base<Resource> }
+/// # #[godot_api]
+/// # impl Shape {
+/// #     #[func(abstract)]
+/// #     fn area(&self) -> f64;
+/// # }
+/// #[derive(GodotClass)]
+/// #[class(abstract, base = Shape)]
+/// struct Polygon {
+///     shape: Shape,
+/// }
+///
+/// #[godot_api]
+/// impl Polygon {}
+///
+/// #[godot_api]
+/// impl IShape for Polygon {
+///     fn area(&self) -> f64 {
+///         0.0
+///     }
+/// }
+/// ```
+///
+/// A concrete method of the base class can call the class's own `#[func(abstract)]` methods -- the template-method pattern. The macro
+/// generates a forwarder for each `&self` abstract method, dispatching through the Godot object (which *is* the subclass):
+///
+/// ```no_run
+/// # use godot::prelude::*;
+/// #[derive(GodotClass)]
+/// #[class(abstract, base = Resource)]
+/// struct Shape {
+///     base: Base<Resource>,
+/// }
+///
+/// #[godot_api]
+/// impl Shape {
+///     #[func(abstract)]
+///     fn area(&self) -> f64;
+///
+///     #[func]
+///     fn area_doubled(&self) -> f64 {
+///         self.area() * 2.0 // forwards to the subclass's implementation.
+///     }
+/// }
+/// ```
+///
+/// Only `&self` abstract methods get a forwarder. Re-entering the object from Rust requires the outer borrow to be shared, which rules out
+/// `&mut self` on either side; `WithBaseField::base_mut()`, the mechanism that would allow it, is unavailable on abstract classes (see
+/// below). A `&mut self` abstract method is therefore callable from outside the class, but not from the base's own code -- attempting it is
+/// a compile error rather than a runtime panic.
+///
 /// Limitations to be aware of:
 ///
 /// * The base class must be declared `#[class(abstract)]` and have a `#[godot_api] impl` block (possibly empty); concrete Rust classes
 ///   cannot be inherited.
+/// * `Gd::bind()`, `Gd::bind_mut()` and `WithBaseField::base_mut()` panic for an abstract class, since each needs the instance's storage,
+///   which holds a subclass's struct. `base()` and `to_gd()` only touch the `Base<T>` handle and remain available.
+/// * `self.signals()` inside an abstract class goes through the object handle rather than a re-borrow guard, so a Rust handler that takes
+///   `&mut self` on the *same* object cannot be invoked from such an emit -- the same restriction as `Gd::signals()`.
+/// * An abstract class cannot implement another abstract class's `I<...>` trait; only concrete classes can. To satisfy an inherited
+///   abstract method part-way down the chain, declare an ordinary `#[func]` of the same name, which every descendant inherits.
 /// * Engine virtual methods (`impl INode for Shape`) declared on the abstract class are *not* inherited by subclasses -- Godot asks the
 ///   most-derived extension class for its virtual table. Override them in each subclass.
 /// * A subclass must not re-declare a `#[func]` or `#[var]` name it inherits; Godot rejects the duplicate registration.

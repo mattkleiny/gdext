@@ -478,10 +478,10 @@ where
 
 /// Panics if `T` is an abstract class (`#[class(abstract)]`), which can never have a Rust instance of its own.
 ///
-/// A `Gd<Abstract>` always points at an object of some concrete subclass, whose instance storage holds *that* class's struct. Handing out
-/// `&Abstract` would reinterpret unrelated memory, so borrowing is rejected -- call Godot methods on the object instead, or downcast with
-/// [`Gd::try_cast()`][crate::obj::Gd::try_cast].
-fn deny_abstract_bind<T: GodotClass>(method_name: &'static str) {
+/// A `Gd<Abstract>` always points at an object of some concrete subclass, whose instance storage holds *that* class's struct. Reaching that
+/// storage as `T` would reinterpret unrelated memory, so any API that does so is rejected -- call Godot methods on the object instead, or
+/// downcast with [`Gd::try_cast()`][crate::obj::Gd::try_cast].
+pub(crate) fn deny_abstract_bind<T: GodotClass>(method_name: &'static str) {
     if T::__IS_ABSTRACT {
         panic!(
             "{}(): cannot borrow the Rust instance of abstract class `{}`.\n\

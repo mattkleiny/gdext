@@ -600,6 +600,10 @@ pub trait WithBaseField: GodotClass + Bounds<Declarer = bounds::DeclUser> {
     /// ```
     #[allow(clippy::let_unit_value)]
     fn base_mut(&mut self) -> BaseMut<'_, Self> {
+        // The guard below needs this instance's storage, which for an abstract class holds a *subclass*'s struct -- a different Rust type.
+        // `base()` and `to_gd()` only touch the `Base<T>` field and stay available.
+        crate::obj::raw_gd::deny_abstract_bind::<Self>("base_mut");
+
         // We need to acquire this first, as the mut-borrow below will block all other access. A raw pointer (not a BorrowedGd tied to
         // &self) is needed, since any shared borrow of self would conflict with that mut-borrow.
         let base_ptr = self.base_field().constructed_obj_sys();

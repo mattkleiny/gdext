@@ -62,13 +62,22 @@ struct FuncAttr {
     pub has_gd_self: bool,
 }
 
-/// An `#[func(abstract)]` declaration, which becomes a method of the generated `<Class>Abstract` trait.
+/// An `#[func(abstract)]` declaration, which becomes a method of the generated `I<Class>` trait.
 struct AbstractFuncDefinition {
     /// Signature without body and without visibility marker (trait methods inherit the trait's visibility).
     fn_signature: venial::Function,
 
     /// The function's non-gdext attributes.
     external_attributes: Vec<venial::Attribute>,
+
+    /// Refined signature, for generating the dynamic-dispatch helper.
+    signature_info: SignatureInfo,
+
+    /// Name the method is registered under in Godot.
+    godot_name: String,
+
+    /// Whether the declaration has a return type.
+    has_return: bool,
 }
 
 #[derive(Default)]
@@ -457,6 +466,9 @@ fn process_godot_fns(
                     abstract_definitions.push(AbstractFuncDefinition {
                         fn_signature,
                         external_attributes: external_attributes.clone(),
+                        signature_info: signature_info.clone(),
+                        godot_name: signature_info.method_name.to_string(),
+                        has_return: function.return_ty.is_some(),
                     });
 
                     removed_indexes.push(index);
@@ -628,13 +640,89 @@ fn make_abstract_items(
     code.extend(quote! {
         #visibility_macro! {
             #[doc = #trait_doc]
+            // Subclasses may instead satisfy the declarations with ordinary `#[func]`s of the same name, leaving the trait unimplemented.
+            #[allow(dead_code)]
             trait #trait_name: ::godot::obj::GodotClass {
                 #( #trait_methods )*
             }
         }
     });
 
+    code.extend(make_abstract_dispatchers(class_name, abstract_funcs));
+
     code
+}
+
+/// Generates inherent methods on the abstract class that forward to the subclass's implementation, through Godot.
+///
+/// This is what lets a concrete method of the base class call its own abstract methods -- the template-method pattern. The base class's
+/// `self` is the embedded base instance, from which the subclass is not reachable in Rust; dispatch therefore goes through the Godot object,
+/// which *is* the subclass.
+///
+/// Only `&self` methods get a forwarder. Re-entering the object from Rust needs the outer borrow to be shared, which rules out `&mut self`
+/// on either side: the mechanism that would allow it, `WithBaseField::base_mut()`, needs this instance's storage, and for an abstract class
+/// that storage holds a subclass's struct. Leaving the forwarder out turns the attempt into a compile error rather than a panic.
+///
+/// Requires a `Base<T>` field somewhere in the class, hence the gate.
+fn make_abstract_dispatchers(
+    class_name: &Ident,
+    abstract_funcs: &[AbstractFuncDefinition],
+) -> TokenStream {
+    let base_field_macro = util::format_class_base_field_macro(class_name);
+
+    let dispatchers = abstract_funcs
+        .iter()
+        .filter(|def| def.signature_info.receiver_type == ReceiverType::Ref)
+        .map(|def| {
+        let signature = &def.fn_signature;
+        let godot_name = &def.godot_name;
+        let params = &def.signature_info.param_idents;
+        let cfg_attrs = util::extract_cfg_attrs(&def.external_attributes)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        let doc = format!(
+            "Calls the subclass's implementation of `{godot_name}`, dispatched through the Godot object.",
+        );
+
+        let call = quote! {
+            let __gdext_obj = ::godot::obj::WithBaseField::to_gd(&*self);
+            let mut __gdext_obj = ::godot::obj::Gd::upcast::<::godot::classes::Object>(__gdext_obj);
+            let __gdext_ret = __gdext_obj.call(
+                #godot_name,
+                &[ #( ::godot::meta::ToGodot::to_variant(&#params) ),* ],
+            );
+        };
+
+        let body = if def.has_return {
+            quote! {
+                #call
+                __gdext_ret.to()
+            }
+        } else {
+            quote! {
+                #call
+                let _ = __gdext_ret;
+            }
+        };
+
+        quote! {
+            #[doc = #doc]
+            #( #cfg_attrs )*
+            #signature {
+                #body
+            }
+        }
+    });
+
+    quote! {
+        #base_field_macro! {
+            #[allow(clippy::needless_lifetimes)]
+            impl #class_name {
+                #( #dispatchers )*
+            }
+        }
+    }
 }
 
 fn process_godot_constants(decl: &mut venial::Impl) -> ParseResult<Vec<ConstDefinition>> {
